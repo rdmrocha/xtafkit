@@ -67,30 +67,21 @@ You need the drive installed in a running Xbox 360 with a custom dashboard (Auro
 
 ### Step 3: Run Comparisons
 
-Compare xtafkit output against your reference data:
+Compare xtafkit's listing against your reference data. When piped, `ls` auto-emits JSON for easy parsing — no flag needed:
 
 ```bash
 # List root directory — compare names, sizes, timestamps against FTP listing
-sudo ./target/release/xtafkit --json ls --partition "360 Data" /dev/rdisk4 /
-
-# Read a file — compare base64 output against your downloaded copy
-sudo ./target/release/xtafkit --json read --partition "360 Data" /dev/rdisk4 /name.txt
+sudo ./target/release/xtafkit ls --partition "360 Data" /dev/rdisk4 / | jq
 
 # Deep traversal — verify subdirectories match
-sudo ./target/release/xtafkit --json ls --partition "360 Data" /dev/rdisk4 /Apps/XeXMenu
-
-# Volume info — check cluster counts, FAT type, used/free space
-sudo ./target/release/xtafkit --json info --partition "360 Data" /dev/rdisk4
+sudo ./target/release/xtafkit ls --partition "360 Data" /dev/rdisk4 /Apps/XeXMenu | jq
 ```
 
-To compare file content programmatically:
+For file content comparisons (read, write, info, hexdump and similar one-off ops are now TUI-only — those used to be CLI subcommands but were dropped in the simplification pass). To compare bytes, launch the TUI, download via the `d` key, then `diff` against your reference copy:
 
 ```bash
-# Download from xtafkit and decode
-sudo ./target/release/xtafkit --json read --partition "360 Data" /dev/rdisk4 /name.txt \
-  | python3 -c "import sys,json,base64; d=json.load(sys.stdin); open('/tmp/xtaf_name.txt','wb').write(base64.b64decode(d['data_base64']))"
-
-# Compare against your FTP-downloaded copy
+sudo ./target/release/xtafkit browse /dev/rdisk4 --partition "360 Data"
+# Navigate to /name.txt, press d, save to /tmp/xtaf_name.txt
 diff /tmp/xtaf_name.txt .tmp/reference-files/name.txt
 ```
 

@@ -64,12 +64,31 @@ struct Cli {
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
 
-    /// Output results as JSON (for programmatic use / MCP integration)
-    #[arg(long, global = true)]
+    /// Force JSON output (overrides the TTY auto-detect).
+    #[arg(long, global = true, conflicts_with = "text")]
     json: bool,
+
+    /// Force human-readable text output (overrides the TTY auto-detect).
+    #[arg(long, global = true, conflicts_with = "json")]
+    text: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+/// Decide whether to emit JSON or human text. When stdout is a terminal we
+/// default to text (so casual `xtafkit ls` lands readable); when piped or
+/// redirected we default to JSON (so scripts/jq get parseable output). The
+/// `--json` and `--text` flags force either mode regardless.
+fn want_json(cli: &Cli) -> bool {
+    use std::io::IsTerminal;
+    if cli.json {
+        return true;
+    }
+    if cli.text {
+        return false;
+    }
+    !std::io::stdout().is_terminal()
 }
 
 // ---------------------------------------------------------------------------
@@ -188,38 +207,47 @@ fn guided_partition_selection() -> Option<SelectedPartition> {
     // Detect disks
     println!("[1/3] Detecting available disks...\n");
     let disks = detect_macos_disks();
-    if disks.is_empty() {
-        println!("No external disks detected.");
-        println!("You can also enter a path to a disk image file.\n");
-    } else {
-        println!("Available disks:");
-        for (i, disk) in disks.iter().enumerate() {
-            println!("  {}) {}", i + 1, disk);
-        }
-        println!(
-            "  {}) Enter a custom path (device or image file)",
-            disks.len() + 1
-        );
-        println!();
-    }
 
-    let device_path = loop {
-        print!("Select a disk [1-{}]: ", disks.len() + 1);
-        io::stdout().flush().unwrap();
-        let input = read_line();
-        if let Ok(n) = input.parse::<usize>() {
-            if n >= 1 && n <= disks.len() {
-                let path = &disks[n - 1];
-                let raw = path.replace("/dev/disk", "/dev/rdisk");
-                break PathBuf::from(raw);
-            } else if n == disks.len() + 1 {
-                print!("Enter device or image path: ");
-                io::stdout().flush().unwrap();
-                let p = read_line();
-                break PathBuf::from(p);
+    let device_path = if disks.len() == 1 {
+        // Exactly one external disk — skip the picker and use it directly.
+        let path = disks[0].replace("/dev/disk", "/dev/rdisk");
+        println!("Found a single external disk; using it automatically:");
+        println!("  {}\n", path);
+        PathBuf::from(path)
+    } else {
+        if disks.is_empty() {
+            println!("No external disks detected.");
+            println!("You can also enter a path to a disk image file.\n");
+        } else {
+            println!("Available disks:");
+            for (i, disk) in disks.iter().enumerate() {
+                println!("  {}) {}", i + 1, disk);
             }
+            println!(
+                "  {}) Enter a custom path (device or image file)",
+                disks.len() + 1
+            );
+            println!();
         }
-        println!("Invalid selection, try again.");
+
+        loop {
+            print!("Select a disk [1-{}]: ", disks.len() + 1);
+            io::stdout().flush().unwrap();
+            let input = read_line();
+            if let Ok(n) = input.parse::<usize>() {
+                if n >= 1 && n <= disks.len() {
+                    let path = &disks[n - 1];
+                    let raw = path.replace("/dev/disk", "/dev/rdisk");
+                    break PathBuf::from(raw);
+                } else if n == disks.len() + 1 {
+                    print!("Enter device or image path: ");
+                    io::stdout().flush().unwrap();
+                    let p = read_line();
+                    break PathBuf::from(p);
+                }
+            }
+            println!("Invalid selection, try again.");
+        }
     };
 
     println!("\nUsing device: {}\n", device_path.display());
@@ -683,7 +711,7 @@ fn main() {
         }
     }
 
-    let json = cli.json;
+    let json = want_json(&cli);
 
     match cli.command {
         None => interactive_mode(),
@@ -829,9 +857,9 @@ fn main() {
             let entry = vol.resolve_path(&path).unwrap_or_else(|e| {
                 if json {
                     println!("{}", serde_json::json!({"error": format!("{}", e)}));
-                    process::exit(0);
+                } else {
+                    eprintln!("Error: {}", e);
                 }
-                eprintln!("Error: {}", e);
                 process::exit(1);
             });
             if !entry.is_directory() {
@@ -848,9 +876,9 @@ fn main() {
             let entries = vol.read_directory(entry.first_cluster).unwrap_or_else(|e| {
                 if json {
                     println!("{}", serde_json::json!({"error": format!("{}", e)}));
-                    process::exit(0);
+                } else {
+                    eprintln!("Error: {}", e);
                 }
-                eprintln!("Error: {}", e);
                 process::exit(1);
             });
             // Eager: when listing /Content, probe each personal XUID for a

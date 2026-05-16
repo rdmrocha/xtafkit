@@ -1,5 +1,18 @@
-fatx-rs
-Copyright 2025-2026 Joshua Reisbord
+xtafkit
+Copyright 2026 rdmrocha
 
-This product includes software developed by Joshua Reisbord
-(https://github.com/joshuareisbord/fatx-rs).
+This project started as a fork of fatx-rs by Joshua Reisbord
+(https://github.com/joshuareisbord/fatx-rs) and is independently
+maintained as a personal variant. The FATX/XTAF filesystem
+implementation traces back to that work; subsequent additions —
+title catalog (merged Xbox 360 + Original Xbox sources), on-demand
+STFS resolution, profile gamertag decryption, slot-aware folder
+display, TUI-first workflow, and scope simplification — are original
+to xtafkit.
+
+Original fatx-rs:
+Copyright 2025-2026 Joshua Reisbord
+Licensed under the Apache License, Version 2.0.
+
+xtafkit and the upstream fatx-rs are both licensed under the Apache
+License, Version 2.0. See LICENSE for the full license text.

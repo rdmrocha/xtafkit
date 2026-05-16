@@ -41,11 +41,11 @@ pub fn len() -> usize {
     cache().read().map(|m| m.len()).unwrap_or(0)
 }
 
-/// Default location of the user cache file (`~/.config/fatx-rs/user_titles.txt`).
+/// Default location of the user cache file (`~/.config/xtafkit/user_titles.txt`).
 /// Returns `None` if `HOME` is not set.
 pub fn default_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/fatx-rs/user_titles.txt"))
+    Some(PathBuf::from(home).join(".config/xtafkit/user_titles.txt"))
 }
 
 /// Load entries from a plain-text file into the runtime cache. Existing
@@ -86,7 +86,7 @@ pub fn save_to(path: &Path) -> io::Result<()> {
     {
         let map = cache().read().map_err(|_| io::Error::other("cache lock"))?;
         let mut file = fs::File::create(&tmp)?;
-        writeln!(file, "# fatx-rs user title cache — one entry per line: <hex-id> <name>")?;
+        writeln!(file, "# xtafkit user title cache — one entry per line: <hex-id> <name>")?;
         let mut entries: Vec<(&u32, &String)> = map.iter().collect();
         entries.sort_by_key(|(id, _)| **id);
         for (id, name) in entries {

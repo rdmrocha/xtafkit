@@ -55,7 +55,7 @@ sudo xtafkit
 ```
 xtafkit                                       launch TUI (guided picker)
 xtafkit browse [DEVICE] [--partition NAME]    launch TUI on a known device
-xtafkit ls <DEVICE> [PATH] [-l] [--json]      list files
+xtafkit ls <DEVICE> [PATH] [-l]               list files (text in TTY, JSON when piped)
 xtafkit scan <DEVICE> [--deep]                detect FATX/XTAF partitions
 xtafkit mkimage <PATH> [--size 1G] [--populate] [--format fatx|xtaf]
 xtafkit resolve <DEVICE> <PATH>               STFS-based title / file resolution
@@ -99,13 +99,23 @@ Auto-dispatches by what you point at:
 - A content-type folder holding standalone STFS files (Arcade / XNA / Marketplace / Installer) → bulk-scans every file.
 - A single STFS file → resolves that one file.
 
-## JSON output
+## Output format
 
-`xtafkit ls --json` returns a structured listing for scripting. Raw on-disk names are preserved (no slot-aware formatting in JSON — that's for the human surfaces only).
+`xtafkit ls` auto-detects: human-readable text when stdout is a terminal, JSON when stdout is piped or redirected. Force either with `--text` or `--json`:
 
 ```bash
-sudo xtafkit ls /dev/rdisk4 --partition "360 Data" /Content --json
+# Text in your terminal:
+sudo xtafkit ls /dev/rdisk4 --partition "360 Data" /Content
+
+# JSON for scripts (auto-detected — no flag needed):
+sudo xtafkit ls /dev/rdisk4 --partition "360 Data" /Content | jq '.[] | .name'
+
+# Force one or the other:
+sudo xtafkit --json ls /dev/rdisk4 --partition "360 Data" /Content
+sudo xtafkit --text ls /dev/rdisk4 --partition "360 Data" /Content > listing.txt
 ```
+
+JSON output preserves raw on-disk names (slot-aware formatting only happens on text output).
 
 ## Project structure
 

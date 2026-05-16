@@ -22,11 +22,11 @@
 //!                     resolution are marked with `?`).
 //!                     - Inside `/Content/<XUID>`: resolve the selected
 //!                       title-ID folder; cached at
-//!                       `~/.config/fatx-rs/user_titles.txt`.
+//!                       `~/.config/xtafkit/user_titles.txt`.
 //!                     - Inside an Arcade / XNA / Marketplace / Installer
 //!                       folder: bulk-scan every file in the current
 //!                       directory; cached at
-//!                       `~/.config/fatx-rs/user_files.txt`.
+//!                       `~/.config/xtafkit/user_files.txt`.
 //!   s                 Toggle sort order between by-name and by-id; also
 //!                     flips which side of the bracket is shown first.
 //!   i                 Show volume info

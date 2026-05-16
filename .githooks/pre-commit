@@ -1,5 +1,5 @@
 #!/bin/bash
-# Pre-commit hook for fatx-rs
+# Pre-commit hook for xtafkit
 # Install: git config core.hooksPath .githooks
 #
 # Runs formatting, linting, and security checks before each commit.

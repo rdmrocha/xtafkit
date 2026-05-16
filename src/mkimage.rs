@@ -1,6 +1,6 @@
-//! fatx mkimage: Create blank FATX/XTAF disk images for testing.
+//! xtafkit mkimage: Create blank FATX/XTAF disk images for testing.
 //!
-//! Generates a file-backed FATX volume that can be used with fatx
+//! Generates a file-backed FATX volume that can be used with xtafkit
 //! without needing a real Xbox hard drive.
 
 use std::fs::{File, OpenOptions};
@@ -137,8 +137,8 @@ pub fn run(args: MkimageArgs) {
     }
 
     println!("Done! Test with:");
-    println!("  fatx ls {} /", args.output.display());
-    println!("  sudo fatx mount {} -v", args.output.display());
+    println!("  xtafkit ls {} /", args.output.display());
+    println!("  xtafkit browse {}", args.output.display());
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {

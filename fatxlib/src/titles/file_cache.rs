@@ -9,7 +9,7 @@
 //! per FATX's allowed character set, so space is not safe as a separator):
 //!
 //! ```text
-//! # fatx-rs user file cache
+//! # xtafkit user file cache
 //! /Content/.../000D0000/abc123\tHalo Wars
 //! ```
 //!
@@ -47,10 +47,10 @@ pub fn len() -> usize {
     cache().read().map(|m| m.len()).unwrap_or(0)
 }
 
-/// Default location of the user file cache (`~/.config/fatx-rs/user_files.txt`).
+/// Default location of the user file cache (`~/.config/xtafkit/user_files.txt`).
 pub fn default_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/fatx-rs/user_files.txt"))
+    Some(PathBuf::from(home).join(".config/xtafkit/user_files.txt"))
 }
 
 /// Load entries from a plain-text file into the runtime cache. Lines must
@@ -89,7 +89,7 @@ pub fn save_to(path: &Path) -> io::Result<()> {
     {
         let map = cache().read().map_err(|_| io::Error::other("cache lock"))?;
         let mut file = fs::File::create(&tmp)?;
-        writeln!(file, "# fatx-rs user file cache — one entry per line: <path>\\t<name>")?;
+        writeln!(file, "# xtafkit user file cache — one entry per line: <path>\\t<name>")?;
         let mut entries: Vec<(&String, &String)> = map.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (p, name) in entries {

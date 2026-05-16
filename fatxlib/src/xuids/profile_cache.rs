@@ -6,7 +6,7 @@
 //! same plain-text format (one entry per line, `<xuid>\t<gamertag>`,
 //! tab-delimited so spaces in gamertags survive).
 //!
-//! Default file: `~/.config/fatx-rs/user_profiles.txt`.
+//! Default file: `~/.config/xtafkit/user_profiles.txt`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -41,7 +41,7 @@ pub fn len() -> usize {
 /// Default location of the persistent cache file.
 pub fn default_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/fatx-rs/user_profiles.txt"))
+    Some(PathBuf::from(home).join(".config/xtafkit/user_profiles.txt"))
 }
 
 /// Load `<xuid>\t<gamertag>` lines into the runtime cache. Missing file is OK.
@@ -89,7 +89,7 @@ pub fn save_to(path: &Path) -> io::Result<()> {
     {
         let map = cache().read().map_err(|_| io::Error::other("cache lock"))?;
         let mut file = fs::File::create(&tmp)?;
-        writeln!(file, "# fatx-rs user profile cache — <xuid>\\t<gamertag>")?;
+        writeln!(file, "# xtafkit user profile cache — <xuid>\\t<gamertag>")?;
         let mut entries: Vec<(&String, &String)> = map.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (xuid, name) in entries {

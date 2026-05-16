@@ -1,5 +1,5 @@
 {
-    "name": "fatx-rs",
+    "name": "xtafkit",
     "build": {
         "dockerfile": "Dockerfile"
     },
