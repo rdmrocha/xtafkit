@@ -45,6 +45,12 @@ pub fn default_path() -> Option<PathBuf> {
 }
 
 /// Load `<xuid>\t<gamertag>` lines into the runtime cache. Missing file is OK.
+///
+/// Entries whose gamertag is empty or equals the XUID (case-insensitive)
+/// are *skipped* — they are remnants of an earlier bug where the STFS
+/// `title_name` field (often the XUID itself) was cached as a gamertag.
+/// Dropping them on load lets the next `/Content` listing re-probe the
+/// drive and write back a correct entry.
 pub fn load_from(path: &Path) -> io::Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -60,10 +66,15 @@ pub fn load_from(path: &Path) -> io::Result<usize> {
         let Some((xuid, name)) = line.split_once('\t') else {
             continue;
         };
-        if xuid.is_empty() {
+        let xuid = xuid.trim();
+        let name = name.trim();
+        if xuid.is_empty() || name.is_empty() {
             continue;
         }
-        map.insert(xuid.to_string(), name.trim_end().to_string());
+        if name.eq_ignore_ascii_case(xuid) {
+            continue;
+        }
+        map.insert(xuid.to_string(), name.to_string());
         loaded += 1;
     }
     Ok(loaded)
@@ -110,6 +121,29 @@ mod tests {
         insert("E00012A9B73ABE44".into(), "Bob".into());
         assert_eq!(lookup("E00012A9B73ABE44"), Some("Bob".into()));
         assert_eq!(lookup("MISSING"), None);
+    }
+
+    #[test]
+    fn load_skips_stale_xuid_equals_name_entries() {
+        let _g = TEST_LOCK.lock().unwrap();
+        clear();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("profiles.txt");
+        fs::write(
+            &p,
+            "# header\n\
+             E00012A9B73ABE44\tE00012A9B73ABE44\n\
+             E00012A9B73ABE45\te00012a9b73abe45\n\
+             E00012A9B73ABE46\tBob\n",
+        )
+        .unwrap();
+        // Two stale entries (value == key, case-insensitive) get dropped;
+        // only the real gamertag is loaded.
+        let n = load_from(&p).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(lookup("E00012A9B73ABE44"), None);
+        assert_eq!(lookup("E00012A9B73ABE45"), None);
+        assert_eq!(lookup("E00012A9B73ABE46"), Some("Bob".to_string()));
     }
 
     #[test]

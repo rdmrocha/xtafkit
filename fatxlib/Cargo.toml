@@ -14,6 +14,8 @@ time = "0.3"
 log = "0.4"
 libc = "0.2"
 phf = "0.11"
+hmac = "0.12"
+sha1 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.29", features = ["fs", "ioctl"] }
