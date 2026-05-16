@@ -12,8 +12,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Sanity-check the tag format before doing any real work ──
+  validate-tag:
+    name: Validate Tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure tag is semver (vMAJOR.MINOR.PATCH[-prerelease])
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::Tag '$tag' is not a valid semver tag."
+            echo "::error::Expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-prerelease (e.g. v1.0.0 or v1.0.0-rc.1)."
+            echo "::error::Delete the bad tag, retag with a valid version, then push:"
+            echo "::error::    git tag -d $tag && git push --delete origin $tag"
+            echo "::error::    git tag <valid-tag> && git push origin <valid-tag>"
+            exit 1
+          fi
+          echo "Tag '$tag' is valid."
+
   # ── Gate: all checks must pass before building release artifacts ──
   format:
+    needs: validate-tag
     name: Format Check
     runs-on: macos-14
     steps:
@@ -29,6 +48,7 @@ jobs:
 
   lint:
     name: Lint (Clippy)
+    needs: validate-tag
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +73,7 @@ jobs:
 
   security:
     name: Security Audit
+    needs: validate-tag
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -68,6 +89,7 @@ jobs:
 
   test:
     name: Test Suite
+    needs: validate-tag
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
