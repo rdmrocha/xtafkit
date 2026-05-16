@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2021"
 description = "A Rust library for reading and writing Xbox FATX file systems"
 license = "Apache-2.0"
-repository = "https://github.com/joshuareisbord/fatx-rs"
+repository = "https://github.com/rdmrocha/xtafkit"
 build = "build.rs"
 
 [dependencies]

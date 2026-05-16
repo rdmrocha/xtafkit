@@ -1,5 +1,5 @@
 #!/bin/bash
-# fatx-agent: Host command bridge for fatx-rs development
+# xtafkit-agent: Host command bridge for xtafkit development
 #
 # Bridges the gap between a sandboxed development environment and the macOS
 # host. Watches .agent/request.json for commands, executes them on the host,
@@ -12,16 +12,16 @@
 #   ftp-ls    — List a directory on an Xbox 360 via FTP
 #   ftp-get   — Download a file from Xbox 360 via FTP
 #   ftp-scan  — Scan local network for FTP servers
-#   <other>   — Passed to the fatx CLI as: fatx --json <command> <device> [args...]
+#   <other>   — Passed to the xtafkit CLI as: xtafkit --json <command> <device> [args...]
 #
 # Usage: sudo bash .agent/agent.sh [device]
 #   device: e.g. /dev/rdisk4 (default)
 
-# NOTE: no set -e — we want the agent to survive fatx errors
+# NOTE: no set -e — we want the agent to survive xtafkit errors
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-CLI="$PROJECT_DIR/target/release/fatx"
+CLI="$PROJECT_DIR/target/release/xtafkit"
 AGENT_DIR="$SCRIPT_DIR"
 REQUEST="$AGENT_DIR/request.json"
 RESPONSE="$AGENT_DIR/response.json"
@@ -29,11 +29,11 @@ LOCK="$AGENT_DIR/processing"
 DEVICE="${1:-/dev/rdisk4}"
 
 if [ ! -f "$CLI" ]; then
-    echo "WARN: fatx not found at $CLI — will build on first request or 'build' command."
+    echo "WARN: xtafkit not found at $CLI — will build on first request or 'build' command."
 fi
 
 echo "╔══════════════════════════════════════════════╗"
-echo "║  fatx-agent — Host Command Bridge            ║"
+echo "║  xtafkit-agent — Host Command Bridge         ║"
 echo "╠══════════════════════════════════════════════╣"
 echo "║  Project: $PROJECT_DIR"
 echo "║  Device:  $DEVICE"
@@ -41,7 +41,7 @@ echo "║  CLI:     $CLI"
 echo "║  Watching: $REQUEST"
 echo "╠══════════════════════════════════════════════╣"
 echo "║  Commands: shell, build, cargo-test,         ║"
-echo "║    ftp-ls, ftp-get, ftp-scan, or fatx <cmd>  ║"
+echo "║   ftp-ls, ftp-get, ftp-scan, or xtafkit <cmd>║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
 echo "Waiting for commands... (Ctrl+C to stop)"
@@ -210,14 +210,14 @@ for a in args:
             fi
             echo "[$TIMESTAMP]   Test done (exit=$EXIT_CODE)"
         else
-            echo "[$TIMESTAMP] > fatx --json $COMMAND $DEVICE ${EXTRA_ARGS[*]}"
+            echo "[$TIMESTAMP] > xtafkit --json $COMMAND $DEVICE ${EXTRA_ARGS[*]}"
 
             # Execute — capture both stdout and stderr, never let it kill the agent
             OUTPUT=$("$CLI" --json "$COMMAND" "$DEVICE" "${EXTRA_ARGS[@]}" 2>&1) || true
             EXIT_CODE=${PIPESTATUS[0]:-$?}
 
             if [ -z "$OUTPUT" ]; then
-                OUTPUT="{\"error\":\"fatx exited with code $EXIT_CODE and no output\"}"
+                OUTPUT="{\"error\":\"xtafkit exited with code $EXIT_CODE and no output\"}"
             fi
             echo "[$TIMESTAMP]   Done (exit=$EXIT_CODE, ${#OUTPUT} bytes)"
         fi

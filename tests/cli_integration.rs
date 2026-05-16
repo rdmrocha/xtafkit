@@ -1,15 +1,15 @@
-//! CLI integration tests for the `fatx` binary.
+//! CLI integration tests for the `xtafkit` binary.
 //!
-//! Tests run the fatx binary against mkimage-generated test images and verify
+//! Tests run the xtafkit binary against mkimage-generated test images and verify
 //! stdout, stderr, and exit codes.
 
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-/// Create fatx command
+/// Create xtafkit command
 fn fatx_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_fatx"))
+    Command::new(env!("CARGO_BIN_EXE_xtafkit"))
 }
 
 /// Create a temp image via `fatx mkimage`. Returns (TempDir, image_path).
@@ -51,8 +51,8 @@ fn test_fatx_version() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("fatx"),
-        "version should contain 'fatx': {}",
+        stdout.contains("xtafkit"),
+        "version should contain 'xtafkit': {}",
         stdout
     );
 }

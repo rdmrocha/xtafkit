@@ -1,6 +1,6 @@
 //! Shared test fixture helpers for fatxlib integration tests.
 //!
-//! Generates temporary FATX/XTAF images by invoking `fatx mkimage`.
+//! Generates temporary FATX/XTAF images by invoking `xtafkit mkimage`.
 //! Each helper returns a `TempDir` (auto-deletes on drop) and an opened `FatxVolume<File>`.
 
 use std::fs::{File, OpenOptions};
@@ -10,8 +10,8 @@ use std::process::Command;
 use fatxlib::volume::FatxVolume;
 use tempfile::TempDir;
 
-/// Find the fatx binary. Uses the workspace target directory.
-fn fatx_bin() -> PathBuf {
+/// Find the xtafkit binary. Uses the workspace target directory.
+fn xtafkit_bin() -> PathBuf {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // fatxlib/Cargo.toml -> go up one level to workspace root
     dir.pop();
@@ -22,16 +22,16 @@ fn fatx_bin() -> PathBuf {
         "release"
     };
 
-    let bin = dir.join("target").join(profile).join("fatx");
+    let bin = dir.join("target").join(profile).join("xtafkit");
     if !bin.exists() {
         let status = Command::new("cargo")
-            .args(["build", "-p", "fatx-cli"])
+            .args(["build", "-p", "xtafkit"])
             .current_dir(&dir)
             .status()
-            .expect("failed to run cargo build for fatx-cli");
-        assert!(status.success(), "failed to build fatx-cli");
+            .expect("failed to run cargo build for xtafkit");
+        assert!(status.success(), "failed to build xtafkit");
     }
-    assert!(bin.exists(), "fatx binary not found at {:?}", bin);
+    assert!(bin.exists(), "xtafkit binary not found at {:?}", bin);
     bin
 }
 
@@ -61,14 +61,14 @@ pub fn create_image(size_mb: u32, format: &str, populate: bool) -> (TempDir, Fat
         args.push("--populate".to_string());
     }
 
-    let output = Command::new(fatx_bin())
+    let output = Command::new(xtafkit_bin())
         .args(&args)
         .output()
-        .expect("failed to run fatx mkimage");
+        .expect("failed to run xtafkit mkimage");
 
     assert!(
         output.status.success(),
-        "fatx mkimage failed: {}",
+        "xtafkit mkimage failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 

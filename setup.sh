@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# fatx-rs setup script for macOS
+# xtafkit setup script for macOS
 # Installs Rust (if needed), runs tests, builds all tools, and optionally installs them.
 #
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 
 echo ""
 echo -e "${BOLD}========================================${NC}"
-echo -e "${BOLD}  fatx-rs setup — Xbox FATX for macOS   ${NC}"
+echo -e "${BOLD}  xtafkit setup — Xbox FATX for macOS   ${NC}"
 echo -e "${BOLD}========================================${NC}"
 echo ""
 
@@ -64,16 +64,16 @@ cargo build --release 2>&1
 
 echo ""
 echo -e "  ${GREEN}Built successfully:${NC}"
-echo "    target/release/fatx         (single binary — CLI, mount, mkimage)"
+echo "    target/release/xtafkit         (single binary — CLI, mount, mkimage, TUI)"
 echo ""
 
 # ---------------------------------------------------------------------------
 # Step 4: Optional install to /usr/local/bin
 # ---------------------------------------------------------------------------
-echo -e "${BOLD}[4/5] Install to /usr/local/bin? (makes 'fatx' available system-wide)${NC}"
+echo -e "${BOLD}[4/5] Install to /usr/local/bin? (makes 'xtafkit' available system-wide)${NC}"
 read -p "  Install? (y/n) [n]: " INSTALL_CHOICE
 
-BINARIES="fatx"
+BINARIES="xtafkit"
 
 if [[ "$INSTALL_CHOICE" == "y" || "$INSTALL_CHOICE" == "Y" ]]; then
     for bin in $BINARIES; do
@@ -90,7 +90,7 @@ if [[ "$INSTALL_CHOICE" == "y" || "$INSTALL_CHOICE" == "Y" ]]; then
     done
 else
     echo "  Skipped. You can run it directly:"
-    echo "    sudo ./target/release/fatx"
+    echo "    sudo ./target/release/xtafkit"
 fi
 echo ""
 
@@ -100,23 +100,23 @@ echo ""
 echo -e "${BOLD}[5/5] Quick start${NC}"
 echo ""
 echo "  Interactive mode (guided — prompts for everything):"
-echo -e "    ${GREEN}sudo fatx${NC}"
+echo -e "    ${GREEN}sudo xtafkit${NC}"
 echo ""
 echo "  Common commands:"
-echo "    sudo fatx scan /dev/rdiskN                              # find Xbox partitions"
-echo "    sudo fatx ls /dev/rdiskN --partition \"360 Data\" /       # list root directory"
-echo "    sudo fatx info /dev/rdiskN --partition \"360 Data\"       # volume stats"
-echo "    sudo fatx mount /dev/rdiskN --partition \"360 Data\" --mount  # mount in Finder"
-echo "    sudo fatx browse /dev/rdiskN --partition \"360 Data\"     # TUI file browser"
-echo "    fatx mkimage test.img --size 1G --populate              # create test image"
+echo "    sudo xtafkit scan /dev/rdiskN                              # find Xbox partitions"
+echo "    sudo xtafkit ls /dev/rdiskN --partition \"360 Data\" /       # list root directory"
+echo "    sudo xtafkit info /dev/rdiskN --partition \"360 Data\"       # volume stats"
+echo "    sudo xtafkit mount /dev/rdiskN --partition \"360 Data\" --mount  # mount in Finder"
+echo "    sudo xtafkit browse /dev/rdiskN --partition \"360 Data\"     # TUI file browser"
+echo "    xtafkit mkimage test.img --size 1G --populate              # create test image"
 echo ""
 echo "  File operations:"
-echo "    sudo fatx read /dev/rdiskN --partition \"360 Data\" /path/to/file"
-echo "    sudo fatx write /dev/rdiskN --partition \"360 Data\" /dest -i local_file"
-echo "    sudo fatx mkdir /dev/rdiskN --partition \"360 Data\" /NewDir"
-echo "    sudo fatx rm /dev/rdiskN --partition \"360 Data\" /file.txt"
-echo "    sudo fatx rename /dev/rdiskN --partition \"360 Data\" /old.txt new.txt"
-echo "    sudo fatx rmr /dev/rdiskN --partition \"360 Data\" /Directory"
+echo "    sudo xtafkit read /dev/rdiskN --partition \"360 Data\" /path/to/file"
+echo "    sudo xtafkit write /dev/rdiskN --partition \"360 Data\" /dest -i local_file"
+echo "    sudo xtafkit mkdir /dev/rdiskN --partition \"360 Data\" /NewDir"
+echo "    sudo xtafkit rm /dev/rdiskN --partition \"360 Data\" /file.txt"
+echo "    sudo xtafkit rename /dev/rdiskN --partition \"360 Data\" /old.txt new.txt"
+echo "    sudo xtafkit rmr /dev/rdiskN --partition \"360 Data\" /Directory"
 echo ""
 echo "  Tips:"
 echo "    - Use /dev/rdiskN (raw device) — not /dev/diskN"

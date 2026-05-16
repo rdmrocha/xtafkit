@@ -1,4 +1,4 @@
-# Contributing to fatx-rs
+# Contributing to xtafkit
 
 Thank you for your interest in contributing! This document explains how the project is organized and how to submit changes.
 
@@ -6,27 +6,23 @@ Thank you for your interest in contributing! This document explains how the proj
 
 | Branch | Purpose | Who sees it |
 |--------|---------|-------------|
-| `main` | Stable releases only | Everyone (default branch on GitHub) |
-| `develop` | Active development | Contributors |
+| `main` | Default branch — current development | Everyone |
 
-**If you're a user:** use the `main` branch. It contains tested, stable releases.
-
-**If you're a contributor:** branch off `develop`, submit PRs targeting `develop`. Changes are merged to `main` only at release time.
+The project is small enough to track on a single branch; feature work happens on short-lived branches off `main`.
 
 ## How to Contribute
 
 1. Fork the repository
-2. Create a feature branch from `develop`: `git checkout -b my-feature develop`
+2. Create a feature branch from `main`: `git checkout -b my-feature main`
 3. Make your changes
 4. Run the test suite: `cargo test --workspace`
-5. Submit a pull request targeting the `develop` branch
+5. Submit a pull request targeting `main`
 
 ## Development Setup
 
 ```bash
-git clone https://github.com/joshuareisbord/fatx-rs.git
-cd fatx-rs
-git checkout develop
+git clone https://github.com/rdmrocha/xtafkit.git
+cd xtafkit
 bash setup.sh
 ```
 
@@ -42,8 +38,8 @@ For manual testing with a physical Xbox 360 drive:
 
 ```bash
 cargo build --release
-sudo ./target/release/fatx scan /dev/rdiskN
-sudo ./target/release/fatx ls /dev/rdiskN --partition "360 Data" /
+sudo ./target/release/xtafkit scan /dev/rdiskN
+sudo ./target/release/xtafkit ls /dev/rdiskN --partition "360 Data" /
 ```
 
 ## Code Style

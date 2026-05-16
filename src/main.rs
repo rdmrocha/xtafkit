@@ -1,10 +1,10 @@
-//! fatx: Command-line tool for interacting with Xbox FATX file systems.
+//! xtafkit: Command-line + TUI tool for interacting with Xbox FATX/XTAF file systems.
 //!
 //! Run with no arguments for interactive mode, or use subcommands directly:
-//!   fatx                     # Interactive guided mode
-//!   fatx browse /dev/rdisk4  # TUI file browser
-//!   fatx scan /dev/rdisk4
-//!   fatx ls /dev/rdisk4 --partition "Data (E)" /
+//!   xtafkit                     # Interactive guided mode
+//!   xtafkit browse /dev/rdisk4  # TUI file browser
+//!   xtafkit scan /dev/rdisk4
+//!   xtafkit ls /dev/rdisk4 --partition "Data (E)" /
 
 mod mkimage;
 mod mount;
@@ -58,13 +58,13 @@ fn get_device_size(file: &mut File) -> u64 {
 
 #[derive(Parser)]
 #[command(
-    name = "fatx",
-    about = "Read and write Xbox FATX file systems on macOS",
+    name = "xtafkit",
+    about = "Read and write Xbox FATX/XTAF file systems on macOS",
     version,
-    long_about = "A command-line tool for interacting with FATX-formatted drives and disk images.\n\n\
-                   Run with no arguments for interactive guided mode.\n\n\
-                   FATX is the filesystem used by the original Xbox console. This tool lets you\n\
-                   browse, extract, and modify files on FATX volumes from macOS."
+    long_about = "Mac-native workbench for FATX/XTAF-formatted Xbox and Xbox 360 drives and disk images.\n\n\
+                   Run with no arguments for interactive guided mode, or `xtafkit browse` for the TUI.\n\n\
+                   Supports title-ID resolution, profile gamertag decoding, slot-aware folder display,\n\
+                   on-demand STFS header parsing, and Finder integration via a local NFS server."
 )]
 struct Cli {
     /// Enable verbose debug output (shows all I/O, FAT lookups, partition probing, etc.)
@@ -339,7 +339,7 @@ struct SelectedPartition {
 }
 
 /// Interactive device detection + partition scanning + selection.
-/// Used by both `interactive_mode` and guided `fatx mount`.
+/// Used by both `interactive_mode` and guided `xtafkit mount`.
 fn guided_partition_selection() -> Option<SelectedPartition> {
     // Check for sudo
     if !running_as_root() {
@@ -456,7 +456,7 @@ fn guided_partition_selection() -> Option<SelectedPartition> {
                 if valid.is_empty() {
                     println!("  No FATX/XTAF partitions found at known Xbox or Xbox 360 offsets.");
                     println!(
-                        "  You can try a deep scan with: fatx scan {} --deep\n",
+                        "  You can try a deep scan with: xtafkit scan {} --deep\n",
                         device_path.display()
                     );
                     return None;
@@ -512,7 +512,7 @@ fn guided_partition_selection() -> Option<SelectedPartition> {
 fn interactive_mode() {
     println!();
     println!("========================================");
-    println!("  fatx — Xbox FATX filesystem tool  ");
+    println!("  xtafkit — Xbox FATX/XTAF filesystem workbench  ");
     println!("========================================");
     println!();
 
@@ -1445,7 +1445,7 @@ fn open_volume(
             eprintln!();
             eprintln!("No --partition specified. This device likely has multiple Xbox partitions.");
             eprintln!(
-                "Run: fatx scan {} to see available partitions.",
+                "Run: xtafkit scan {} to see available partitions.",
                 device.display()
             );
 
@@ -1467,7 +1467,7 @@ fn open_volume(
                         }
                         eprintln!();
                         eprintln!(
-                            "Example: sudo fatx browse {} --partition \"{}\"",
+                            "Example: sudo xtafkit browse {} --partition \"{}\"",
                             device.display(),
                             parts
                                 .iter()
@@ -1627,7 +1627,7 @@ fn main() {
                 // Guided mode
                 println!();
                 println!("========================================");
-                println!("  fatx browse — guided setup");
+                println!("  xtafkit browse — guided setup");
                 println!("========================================");
                 println!();
                 match guided_partition_selection() {
@@ -2380,7 +2380,7 @@ fn main() {
             if args.device.is_none() && !args.cleanup {
                 println!();
                 println!("========================================");
-                println!("  fatx mount — guided setup");
+                println!("  xtafkit mount — guided setup");
                 println!("========================================");
                 println!();
 

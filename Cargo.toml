@@ -1,13 +1,13 @@
 [package]
-name = "fatx-cli"
+name = "xtafkit"
 version = "0.3.0"
 edition = "2021"
-description = "CLI tool for interacting with Xbox FATX file systems"
+description = "Mac-native TUI workbench for Xbox 360 FATX/XTAF drives — browse, transfer, resolve titles, decode profiles"
 license = "Apache-2.0"
-repository = "https://github.com/joshuareisbord/fatx-rs"
+repository = "https://github.com/rdmrocha/xtafkit"
 
 [[bin]]
-name = "fatx"
+name = "xtafkit"
 path = "src/main.rs"
 
 [dependencies]
