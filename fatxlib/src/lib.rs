@@ -30,6 +30,7 @@ pub mod display;
 pub mod error;
 pub mod partition;
 pub mod platform;
+pub mod stfs;
 pub mod titles;
 pub mod types;
 pub mod volume;

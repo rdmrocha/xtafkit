@@ -308,6 +308,22 @@ enum Commands {
     Mount(mount::MountArgs),
     /// Create a blank FATX/XTAF disk image for testing
     Mkimage(mkimage::MkimageArgs),
+    /// Resolve a title-ID folder's name by parsing the STFS header inside,
+    /// caching the result for future runs
+    Resolve {
+        device: PathBuf,
+        /// Path to a `Content/<XUID>/<TitleID>` folder to resolve.
+        path: String,
+        #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
+        offset: u64,
+        #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
+        size: u64,
+        #[arg(long)]
+        partition: Option<String>,
+        /// Skip writing the resolved name to the user cache file.
+        #[arg(long)]
+        no_save: bool,
+    },
 }
 
 // ===========================================================================
@@ -1557,6 +1573,12 @@ fn print_entry(entry: &fatxlib::types::DirectoryEntry, parent_path: &str, long: 
 fn main() {
     let cli = Cli::parse();
 
+    // Best-effort load of user-resolved titles. Silent on failure — a missing
+    // file is normal on first run, and any error here shouldn't block CLI use.
+    if let Some(cache_path) = fatxlib::titles::user_cache::default_path() {
+        let _ = fatxlib::titles::user_cache::load_from(&cache_path);
+    }
+
     // Mount and mkimage init their own loggers with their preferred format.
     // Only init the CLI logger for other subcommands.
     let is_mount = matches!(cli.command, Some(Commands::Mount(_)));
@@ -2366,6 +2388,77 @@ fn main() {
 
         Some(Commands::Mkimage(args)) => {
             mkimage::run(args);
+        }
+
+        Some(Commands::Resolve {
+            device,
+            path,
+            offset,
+            size,
+            partition,
+            no_save,
+        }) => {
+            let mut vol = open_volume(&device, &partition, offset, size);
+            let outcome = fatxlib::titles::dynamic::resolve_and_cache(
+                &mut vol, &path, !no_save,
+            );
+
+            match outcome {
+                Ok(fatxlib::titles::dynamic::ResolveOutcome::Resolved {
+                    title_id,
+                    name,
+                    saved_to,
+                }) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "title_id": format!("{:08X}", title_id),
+                                "name": name,
+                                "saved_to": saved_to
+                                    .as_ref()
+                                    .map(|p| p.to_string_lossy().to_string()),
+                            })
+                        );
+                    } else {
+                        println!("Resolved {:08X} → {}", title_id, name);
+                        if let Some(p) = saved_to {
+                            println!("Saved to {}", p.display());
+                        }
+                    }
+                }
+                Ok(fatxlib::titles::dynamic::ResolveOutcome::BadTitleIdInPath {
+                    last_segment,
+                }) => {
+                    let msg = format!(
+                        "path's last segment is not an 8-hex title ID: {:?}",
+                        last_segment
+                    );
+                    if json {
+                        println!("{}", serde_json::json!({"error": msg}));
+                        process::exit(0);
+                    }
+                    eprintln!("Error: {}", msg);
+                    process::exit(1);
+                }
+                Ok(fatxlib::titles::dynamic::ResolveOutcome::NoStfs) => {
+                    let msg = "no parseable STFS package found in folder";
+                    if json {
+                        println!("{}", serde_json::json!({"error": msg}));
+                        process::exit(0);
+                    }
+                    eprintln!("Could not resolve: {}", msg);
+                    process::exit(2);
+                }
+                Err(e) => {
+                    if json {
+                        println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                        process::exit(0);
+                    }
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            }
         }
     }
 }

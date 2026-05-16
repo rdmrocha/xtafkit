@@ -10,6 +10,14 @@
 //! wins (it's derived directly from the disc's `default.xbe` and tends to
 //! have better editorial capitalization/punctuation), and `source` is set
 //! to [`Source::Both`].
+//!
+//! Two submodules layer on top of the static catalog:
+//!   * [`dynamic`] — read an STFS package header to resolve an unknown ID.
+//!   * [`user_cache`] — persist successful dynamic resolutions to disk so
+//!     they survive across runs.
+
+pub mod dynamic;
+pub mod user_cache;
 
 /// Which catalog(s) sourced this entry. Useful for UI hints like a `[BC]`
 /// badge on backwards-compatible titles.
@@ -18,6 +26,8 @@ pub enum Source {
     Xbox360,
     XboxOriginal,
     Both,
+    /// Resolved at runtime via STFS header parse and stored in the user cache.
+    User,
 }
 
 /// One entry in the merged title catalog.
@@ -29,11 +39,21 @@ pub struct TitleInfo {
 
 include!(concat!(env!("OUT_DIR"), "/titles.rs"));
 
-/// Resolve a title ID to its display name and source. Returns `None` for
-/// unknown IDs (homebrew, dev kit, region-specific releases not in either
-/// source).
+/// Resolve a title ID to its display name and source. The compiled-in
+/// catalog wins; if it misses, the runtime user cache (populated by
+/// `user_cache::load_from` and the on-demand resolver) is consulted next.
+/// Returns `None` if neither source knows this ID.
 pub fn lookup(title_id: u32) -> Option<TitleInfo> {
-    TITLES.get(&title_id).copied()
+    if let Some(info) = TITLES.get(&title_id).copied() {
+        return Some(info);
+    }
+    user_cache::lookup(title_id).map(|name| TitleInfo {
+        // Leak is fine: the user cache is a tiny long-lived map. This avoids
+        // changing TitleInfo to own its name string and rippling that
+        // through every caller.
+        name: Box::leak(name.into_boxed_str()),
+        source: Source::User,
+    })
 }
 
 /// Render a raw on-disk title folder name (e.g. `"4D5307E6"`) as

@@ -18,6 +18,10 @@
 //!   m                 Create new directory (mkdir)
 //!   D                 Delete selected file/directory
 //!   r                 Rename selected file/directory
+//!   R                 Resolve title name from STFS header (when inside
+//!                     `/Content/<XUID>`; entries needing resolution are
+//!                     marked with `?`). Result is cached at
+//!                     `~/.config/fatx-rs/user_titles.txt`.
 //!   i                 Show volume info
 //!   c                 Clean up macOS metadata from current directory
 //!   Esc               Cancel a running I/O operation (when busy) / quit (when idle)
@@ -86,6 +90,10 @@ enum IoCmd {
         fatx_dest: String,
     },
     Mkdir {
+        path: String,
+    },
+    ResolveTitle {
+        /// Path to a title-ID folder (e.g. `/Content/<XUID>/<TitleID>`).
         path: String,
     },
     Delete {
@@ -620,6 +628,25 @@ fn io_worker(
                 });
             }
 
+            IoCmd::ResolveTitle { path } => {
+                use fatxlib::titles::dynamic::{resolve_and_cache, ResolveOutcome};
+                let resp = match resolve_and_cache(&mut vol, &path, true) {
+                    Ok(ResolveOutcome::Resolved { name, .. }) => IoResp::Done {
+                        message: format!("Resolved → {}", name),
+                    },
+                    Ok(ResolveOutcome::NoStfs) => IoResp::Error {
+                        message: "No parseable STFS package in this folder".into(),
+                    },
+                    Ok(ResolveOutcome::BadTitleIdInPath { last_segment }) => IoResp::Error {
+                        message: format!("Not a title-ID folder: {:?}", last_segment),
+                    },
+                    Err(e) => IoResp::Error {
+                        message: format!("Resolve error: {}", e),
+                    },
+                };
+                let _ = resp_tx.send(resp);
+            }
+
             IoCmd::Flush => {
                 let _ = vol.flush();
                 let _ = resp_tx.send(IoResp::Flushed);
@@ -978,6 +1005,27 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
             app.input_buffer.clear();
             app.input_mode = InputMode::MkdirName;
         }
+        KeyCode::Char('R') => {
+            // Only meaningful when the children of cwd are title-ID folders
+            // (i.e. we're inside `/Content/<XUID>`), and the selection is a
+            // directory whose display name didn't get resolved.
+            let slot = fatxlib::display::folder_slot(&app.cwd);
+            if slot != fatxlib::display::FolderSlot::TitleId {
+                app.set_error("Resolve only works inside Content/<XUID>");
+                return;
+            }
+            let Some(entry) = app.selected_entry() else {
+                return;
+            };
+            if !entry.is_dir {
+                app.set_error("Select a title-ID folder to resolve");
+                return;
+            }
+            let path = app.full_path(&entry.name);
+            app.set_status("Reading STFS header...");
+            let _ = cmd_tx.send(IoCmd::ResolveTitle { path });
+            app.is_busy = true;
+        }
         KeyCode::Char('D') => {
             if let Some(name) = app.selected_name() {
                 let is_dir = app.selected_entry().map(|e| e.is_dir).unwrap_or(false);
@@ -1169,19 +1217,26 @@ fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(header, chunks[0]);
 
     // -- File list --
+    // Children of cwd are in this slot — used to flag unresolved title-ID
+    // folders with a `?` so the user knows R can resolve them.
+    let child_slot = fatxlib::display::folder_slot(&app.cwd);
     let items: Vec<ListItem> = app
         .entries
         .iter()
         .map(|e| {
             let icon = if e.is_dir { "📁" } else { "📄" };
+            let resolvable = child_slot == fatxlib::display::FolderSlot::TitleId
+                && e.is_dir
+                && e.display_name == e.name;
+            let marker = if resolvable { "?" } else { " " };
             let size_str = if e.is_dir {
                 "<DIR>".to_string()
             } else {
                 format_size(e.size)
             };
             let line = format!(
-                " {} {:<42} {:>10}  {}  {}",
-                icon, e.display_name, size_str, e.modified, e.attributes,
+                " {} {} {:<41} {:>10}  {}  {}",
+                icon, marker, e.display_name, size_str, e.modified, e.attributes,
             );
             let style = if e.is_dir {
                 Style::default().fg(Color::Cyan).bold()
@@ -1237,7 +1292,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         let help = if app.is_busy {
             " Esc: cancel "
         } else {
-            " d:download  u:upload  m:mkdir  D:delete  r:rename  i:info  c:cleanup  q:quit "
+            " d:download  u:upload  m:mkdir  D:delete  r:rename  R:resolve  i:info  c:cleanup  q:quit "
         };
         let status_bar = Paragraph::new(format!(" {}", app.status))
             .style(style)
