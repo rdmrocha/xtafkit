@@ -1388,6 +1388,7 @@ fn run_god(
     // Catalog-fill the game title from the dry-run report, unless the
     // caller passed --game-title explicitly.
     let mut dry_opts = fatxlib::iso2god::ConvertOptions {
+        trim: trim_mode,
         dry_run: true,
         ..Default::default()
     };
@@ -1492,21 +1493,28 @@ fn run_god(
                         "title_id": format!("{:08X}", r.title_id),
                         "media_id": format!("{:08X}", r.media_id),
                         "name": resolved_name.unwrap_or("(unknown)"),
+                        "content_type": format!("{:?}", r.content_type),
                         "data_size": r.data_size,
+                        "block_count": r.block_count,
                         "part_count": r.part_count,
                         "elapsed_secs": elapsed.as_secs_f64(),
                     })
                 );
             } else {
+                let resolved_label = resolved_name.unwrap_or("(unknown — catalog miss)");
                 println!(
-                    "Converted {} → {}/{:08X}/{:08X?}/... ({} parts, {} of data) in {:?}",
+                    "ISO:         {}\nTitle ID:    {:08X}\nMedia ID:    {:08X}\nName:        {}\nContent:     {:?}\nData size:   {} bytes ({})\nBlock count: {}\nPart count:  {}\nDest:        {}\nElapsed:     {:?}",
                     iso.display(),
-                    dest.display(),
                     r.title_id,
-                    r.content_type as u32,
-                    r.part_count,
+                    r.media_id,
+                    resolved_label,
+                    r.content_type,
+                    r.data_size,
                     format_size(r.data_size),
-                    elapsed,
+                    r.block_count,
+                    r.part_count,
+                    dest.display(),
+                    elapsed
                 );
             }
         }
