@@ -31,7 +31,7 @@ fn test_prev_free_after_free_still_advances() {
     let (_tmp, mut vol) = common::create_fatx_image(4);
 
     let c1 = vol.allocate_cluster().expect("alloc 1");
-    let c2 = vol.allocate_cluster().expect("alloc 2");
+    let _c2 = vol.allocate_cluster().expect("alloc 2");
     let c3 = vol.allocate_cluster().expect("alloc 3");
 
     // Free c1 (early cluster)

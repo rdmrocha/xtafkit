@@ -71,6 +71,34 @@ struct CopyFromHostState<'a> {
     bytes_since_flush: u64,
 }
 
+#[doc(hidden)]
+#[must_use = "WriteSession must be commit()'d or cancel()'d"]
+pub struct WriteSession {
+    parent_cluster: u32,
+    first_cluster: u32,
+    old_count: usize,
+    chain: Vec<u32>,
+    new_size: usize,
+    finalized: bool,
+}
+
+impl WriteSession {
+    pub fn clusters(&self) -> &[u32] {
+        &self.chain
+    }
+}
+
+impl Drop for WriteSession {
+    fn drop(&mut self) {
+        if !self.finalized {
+            warn!(
+                "WriteSession for cluster {} dropped without commit/cancel; uncommitted FAT reservations may remain",
+                self.first_cluster
+            );
+        }
+    }
+}
+
 impl<T: Read + Write + Seek> FatxVolume<T> {
     /// Open a FATX volume.
     ///
@@ -501,7 +529,21 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     /// Read a single FAT entry for the given cluster.
     /// Takes `&self` — only reads from the in-memory fat_cache, no device I/O.
     pub fn read_fat_entry(&self, cluster: u32) -> Result<FatEntry> {
+        if cluster < FIRST_CLUSTER || cluster >= FIRST_CLUSTER + self.total_clusters {
+            return Err(FatxError::ClusterOutOfRange(
+                cluster,
+                FIRST_CLUSTER + self.total_clusters - 1,
+            ));
+        }
+
         let cache_offset = (cluster as u64 * self.fat_type.entry_size()) as usize;
+        let entry_size = self.fat_type.entry_size() as usize;
+        if cache_offset + entry_size > self.fat_cache.len() {
+            return Err(FatxError::ClusterOutOfRange(
+                cluster,
+                FIRST_CLUSTER + self.total_clusters - 1,
+            ));
+        }
 
         match self.fat_type {
             FatType::Fat16 => {
@@ -514,7 +556,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                     FAT16_FREE => FatEntry::Free,
                     FAT16_BAD => FatEntry::Bad,
                     v if v >= FAT16_EOC => FatEntry::EndOfChain,
-                    v => FatEntry::Next(v as u32),
+                    v => {
+                        let next = v as u32;
+                        if next < FIRST_CLUSTER || next >= FIRST_CLUSTER + self.total_clusters {
+                            return Err(FatxError::CorruptChain(cluster));
+                        }
+                        FatEntry::Next(next)
+                    }
                 })
             }
             FatType::Fat32 => {
@@ -529,7 +577,12 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                     FAT32_FREE => FatEntry::Free,
                     FAT32_BAD => FatEntry::Bad,
                     v if v >= FAT32_EOC => FatEntry::EndOfChain,
-                    v => FatEntry::Next(v),
+                    v => {
+                        if v < FIRST_CLUSTER || v >= FIRST_CLUSTER + self.total_clusters {
+                            return Err(FatxError::CorruptChain(cluster));
+                        }
+                        FatEntry::Next(v)
+                    }
                 })
             }
         }
@@ -597,11 +650,18 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     /// the list of clusters in order.
     /// Takes `&self` — only reads from the in-memory fat_cache, no device I/O.
     pub fn read_chain(&self, start_cluster: u32) -> Result<Vec<u32>> {
+        use std::collections::HashSet;
+
         let mut chain = Vec::new();
+        let mut seen = HashSet::new();
         let mut current = start_cluster;
         let max_iters = self.total_clusters as usize + 1; // safety bound
 
         for _ in 0..max_iters {
+            if !seen.insert(current) {
+                warn!("Cluster chain cycle detected at {}", current);
+                return Err(FatxError::CorruptChain(current));
+            }
             chain.push(current);
             match self.read_fat_entry(current)? {
                 FatEntry::EndOfChain => break,
@@ -615,6 +675,14 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                     return Err(FatxError::CorruptChain(current));
                 }
             }
+        }
+
+        if chain.len() > self.total_clusters as usize {
+            warn!(
+                "Cluster chain exceeded total cluster count from {}",
+                start_cluster
+            );
+            return Err(FatxError::CorruptChain(current));
         }
 
         Ok(chain)
@@ -1088,23 +1156,42 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
         // No free slot in existing clusters — allocate a new cluster for the directory
         let new_cluster = self.allocate_cluster()?;
-
-        // Extend the chain: update the last cluster to point to the new one
         let last_cluster = *chain.last().unwrap();
-        self.write_fat_entry(last_cluster, FatEntry::Next(new_cluster))?;
+        let result = (|| -> Result<()> {
+            // Extend the chain: update the last cluster to point to the new one
+            self.write_fat_entry(last_cluster, FatEntry::Next(new_cluster))?;
 
-        // Initialize the new cluster with 0xFF (end markers)
-        let blank = vec![0xFF; cluster_size];
-        self.write_cluster(new_cluster, &blank)?;
+            // Initialize the new cluster with 0xFF (end markers)
+            let blank = vec![0xFF; cluster_size];
+            self.write_cluster(new_cluster, &blank)?;
 
-        // Write the entry at the first slot of the new cluster
-        let base_offset = self.cluster_offset(new_cluster)?;
-        let raw = self.serialize_dirent(entry);
-        self.write_at(base_offset, &raw)?;
+            // Write the entry at the first slot of the new cluster
+            let base_offset = self.cluster_offset(new_cluster)?;
+            let raw = self.serialize_dirent(entry);
+            self.write_at(base_offset, &raw)?;
 
-        // Write end marker at slot 1
-        if entries_per_cluster > 1 {
-            self.write_at(base_offset + DIRENT_SIZE as u64, &[DIRENT_END])?;
+            // Write end marker at slot 1
+            if entries_per_cluster > 1 {
+                self.write_at(base_offset + DIRENT_SIZE as u64, &[DIRENT_END])?;
+            }
+
+            Ok(())
+        })();
+
+        if let Err(err) = result {
+            if let Err(cleanup_err) = self.write_fat_entry(last_cluster, FatEntry::EndOfChain) {
+                warn!(
+                    "add_dirent cleanup restore for parent {} failed after error {}: {}",
+                    parent_cluster, err, cleanup_err
+                );
+            }
+            if let Err(cleanup_err) = self.write_fat_entry(new_cluster, FatEntry::Free) {
+                warn!(
+                    "add_dirent cleanup free for new cluster {} failed after error {}: {}",
+                    new_cluster, err, cleanup_err
+                );
+            }
+            return Err(err);
         }
 
         Ok(())
@@ -1234,36 +1321,49 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
         // Allocate one cluster for the new directory
         let cluster = self.allocate_cluster()?;
+        let result = (|| -> Result<()> {
+            // Initialize with end markers
+            let cluster_size = self.superblock.cluster_size() as usize;
+            let blank = vec![0xFFu8; cluster_size];
+            self.write_cluster(cluster, &blank)?;
 
-        // Initialize with end markers
-        let cluster_size = self.superblock.cluster_size() as usize;
-        let blank = vec![0xFFu8; cluster_size];
-        self.write_cluster(cluster, &blank)?;
+            // Use UTC so Xbox displays correct local time
+            let now = time::OffsetDateTime::now_utc();
+            let date = DirectoryEntry::encode_date(now.year() as u16, now.month() as u8, now.day());
+            let time = DirectoryEntry::encode_time(now.hour(), now.minute(), now.second());
 
-        // Use UTC so Xbox displays correct local time
-        let now = time::OffsetDateTime::now_utc();
-        let date = DirectoryEntry::encode_date(now.year() as u16, now.month() as u8, now.day());
-        let time = DirectoryEntry::encode_time(now.hour(), now.minute(), now.second());
+            let mut filename_raw = [0xFFu8; MAX_FILENAME_LEN];
+            let name_bytes = dirname.as_bytes();
+            filename_raw[..name_bytes.len()].copy_from_slice(name_bytes);
 
-        let mut filename_raw = [0xFFu8; MAX_FILENAME_LEN];
-        let name_bytes = dirname.as_bytes();
-        filename_raw[..name_bytes.len()].copy_from_slice(name_bytes);
+            let entry = DirectoryEntry {
+                filename_len: name_bytes.len() as u8,
+                attributes: FileAttributes::DIRECTORY,
+                filename_raw,
+                first_cluster: cluster,
+                file_size: 0,
+                creation_time: time,
+                creation_date: date,
+                write_time: time,
+                write_date: date,
+                access_time: time,
+                access_date: date,
+            };
 
-        let entry = DirectoryEntry {
-            filename_len: name_bytes.len() as u8,
-            attributes: FileAttributes::DIRECTORY,
-            filename_raw,
-            first_cluster: cluster,
-            file_size: 0,
-            creation_time: time,
-            creation_date: date,
-            write_time: time,
-            write_date: date,
-            access_time: time,
-            access_date: date,
-        };
+            self.add_dirent_to_directory(parent.first_cluster, &entry)?;
+            Ok(())
+        })();
 
-        self.add_dirent_to_directory(parent.first_cluster, &entry)?;
+        if let Err(err) = result {
+            if let Err(cleanup_err) = self.write_fat_entry(cluster, FatEntry::Free) {
+                warn!(
+                    "create_directory cleanup for '{}' failed after error {}: {}",
+                    path, err, cleanup_err
+                );
+            }
+            return Err(err);
+        }
+
         info!("Created directory '{}'", dirname);
         Ok(())
     }
@@ -1299,6 +1399,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         // Read the existing cluster chain
         let old_chain = self.read_chain(target.first_cluster)?;
         let old_count = old_chain.len();
+        let mut chain = old_chain.clone();
 
         // ── Phase 1: Extend chain if file grew ──
         if clusters_needed > old_count {
@@ -1353,11 +1454,12 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                 self.write_fat_entry(new_clusters[i], FatEntry::Next(new_clusters[i + 1]))?;
             }
             self.write_fat_entry(*new_clusters.last().unwrap(), FatEntry::EndOfChain)?;
+
+            // Re-read chain after the extension is linked into the FAT cache.
+            chain = self.read_chain(target.first_cluster)?;
         }
 
         // ── Phase 2: Write data to clusters ──
-        // Re-read chain (may have been extended)
-        let chain = self.read_chain(target.first_cluster)?;
         let mut offset = 0;
         for &cluster in chain.iter().take(clusters_needed) {
             let end = (offset + cluster_size).min(data.len());
@@ -1370,7 +1472,14 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             offset += cluster_size;
         }
 
-        // ── Phase 3: Free excess clusters if file shrank ──
+        // ── Phase 3: Publish the new logical file size and timestamps ──
+        //
+        // This happens only after all payload writes completed, so callers never
+        // observe a dirent advertising bytes that haven't been written yet.
+        let now = time::OffsetDateTime::now_utc();
+        self.update_dirent_metadata(parent.first_cluster, filename, data.len() as u32, Some(now))?;
+
+        // ── Phase 4: Free excess clusters if file shrank ──
         if clusters_needed < old_count {
             // Mark the new last cluster as EOC
             self.write_fat_entry(chain[clusters_needed - 1], FatEntry::EndOfChain)?;
@@ -1379,10 +1488,6 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                 self.write_fat_entry(cluster, FatEntry::Free)?;
             }
         }
-
-        // ── Phase 4: Update directory entry size and modification timestamps ──
-        let now = time::OffsetDateTime::now_utc();
-        self.update_dirent_metadata(parent.first_cluster, filename, data.len() as u32, Some(now))?;
 
         info!(
             "Wrote '{}' in-place ({} bytes, {} clusters, was {})",
@@ -1394,23 +1499,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         Ok(())
     }
 
-    /// Prepare a file for in-place writing: extend or shrink the cluster chain
-    /// as needed and update the directory entry size. Returns the cluster chain
-    /// that the caller should write data to (one cluster at a time).
-    ///
-    /// This separates the fast FAT operations (chain management) from the slow
-    /// data writing (USB I/O), allowing callers to release locks between cluster
-    /// writes to avoid blocking other operations.
-    ///
-    /// After calling this, write data to each cluster in the returned chain using
-    /// `write_cluster()`, then call `flush()` to persist FAT changes.
-    pub fn prepare_write_in_place(&mut self, path: &str, new_size: usize) -> Result<Vec<u32>> {
-        let (parent_path, filename) = split_path(path);
-        let parent = self.resolve_path(parent_path)?;
-        let target = self.resolve_path(path)?;
-
+    fn plan_write_in_place_for_entry(
+        &mut self,
+        target: &DirectoryEntry,
+        new_size: usize,
+    ) -> Result<(usize, Vec<u32>)> {
         if target.is_directory() {
-            return Err(FatxError::IsADirectory(path.to_string()));
+            return Err(FatxError::IsADirectory(target.filename()));
         }
 
         let cluster_size = self.superblock.cluster_size() as usize;
@@ -1423,7 +1518,6 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         let old_chain = self.read_chain(target.first_cluster)?;
         let old_count = old_chain.len();
 
-        // Extend chain if file grew
         if clusters_needed > old_count {
             let extra = clusters_needed - old_count;
             let last_old = *old_chain.last().unwrap();
@@ -1472,24 +1566,91 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             self.write_fat_entry(*new_clusters.last().unwrap(), FatEntry::EndOfChain)?;
         }
 
-        // Get the full chain (may have been extended)
-        let chain = self.read_chain(target.first_cluster)?;
+        let planned_chain = if clusters_needed > old_count {
+            self.read_chain(target.first_cluster)?
+        } else {
+            old_chain
+        };
 
-        // Free excess clusters if file shrank
-        if clusters_needed < old_count {
-            self.write_fat_entry(chain[clusters_needed - 1], FatEntry::EndOfChain)?;
-            for &cluster in chain.iter().take(old_count).skip(clusters_needed) {
+        Ok((
+            old_count,
+            planned_chain.into_iter().take(clusters_needed).collect(),
+        ))
+    }
+
+    fn find_entry_in_parent_by_cluster(
+        &mut self,
+        parent_cluster: u32,
+        first_cluster: u32,
+    ) -> Result<DirectoryEntry> {
+        let entries = if parent_cluster == FIRST_CLUSTER {
+            self.read_root_directory()?
+        } else {
+            self.read_directory(parent_cluster)?
+        };
+        entries
+            .into_iter()
+            .find(|entry| entry.first_cluster == first_cluster)
+            .ok_or_else(|| FatxError::FileNotFound(format!("cluster {}", first_cluster)))
+    }
+
+    #[doc(hidden)]
+    pub fn begin_write_in_place_for_entry(
+        &mut self,
+        parent_cluster: u32,
+        first_cluster: u32,
+        new_size: usize,
+    ) -> Result<WriteSession> {
+        let target = self.find_entry_in_parent_by_cluster(parent_cluster, first_cluster)?;
+        let (old_count, chain) = self.plan_write_in_place_for_entry(&target, new_size)?;
+        Ok(WriteSession {
+            parent_cluster,
+            first_cluster,
+            old_count,
+            chain,
+            new_size,
+            finalized: false,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn commit_write_session(&mut self, mut session: WriteSession) -> Result<()> {
+        let target =
+            self.find_entry_in_parent_by_cluster(session.parent_cluster, session.first_cluster)?;
+        let filename = target.filename();
+
+        let now = time::OffsetDateTime::now_utc();
+        self.update_dirent_metadata(
+            session.parent_cluster,
+            &filename,
+            session.new_size as u32,
+            Some(now),
+        )?;
+
+        if session.chain.len() < session.old_count {
+            let full_chain = self.read_chain(session.first_cluster)?;
+            self.write_fat_entry(full_chain[session.chain.len() - 1], FatEntry::EndOfChain)?;
+            for &cluster in full_chain.iter().skip(session.chain.len()) {
                 self.write_fat_entry(cluster, FatEntry::Free)?;
             }
         }
 
-        // Update directory entry size and write/access timestamps. Callers may
-        // still perform the actual cluster writes later, but this keeps the
-        // overwrite semantics consistent with in-place writes.
-        let now = time::OffsetDateTime::now_utc();
-        self.update_dirent_metadata(parent.first_cluster, filename, new_size as u32, Some(now))?;
+        session.finalized = true;
+        Ok(())
+    }
 
-        Ok(chain.into_iter().take(clusters_needed).collect())
+    #[doc(hidden)]
+    pub fn cancel_write_session(&mut self, mut session: WriteSession) -> Result<()> {
+        if session.chain.len() > session.old_count {
+            let old_last = session.chain[session.old_count - 1];
+            self.write_fat_entry(old_last, FatEntry::EndOfChain)?;
+            for &cluster in session.chain.iter().skip(session.old_count) {
+                self.write_fat_entry(cluster, FatEntry::Free)?;
+            }
+        }
+
+        session.finalized = true;
+        Ok(())
     }
 
     /// Update selected mutable metadata for a directory entry on disk.
@@ -1911,10 +2072,34 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
         let (parent_path, old_name) = split_path(old_path);
         let parent = self.resolve_path(parent_path)?;
+        let source = self.resolve_path(old_path)?;
 
         let chain = self.read_chain(parent.first_cluster)?;
         let cluster_size = self.superblock.cluster_size() as usize;
         let entries_per_cluster = cluster_size / DIRENT_SIZE;
+
+        for &cluster in &chain {
+            let base_offset = self.cluster_offset(cluster)?;
+            for slot in 0..entries_per_cluster {
+                let slot_offset = base_offset + (slot * DIRENT_SIZE) as u64;
+                let entry = self.read_dirent_at(slot_offset)?;
+
+                if entry.is_end() {
+                    break;
+                }
+                if !entry.is_deleted()
+                    && entry.first_cluster != source.first_cluster
+                    && entry.filename().eq_ignore_ascii_case(new_name)
+                {
+                    let dest_path = if parent_path == "/" {
+                        format!("/{}", new_name)
+                    } else {
+                        format!("{}/{}", parent_path, new_name)
+                    };
+                    return Err(FatxError::FileExists(dest_path));
+                }
+            }
+        }
 
         for &cluster in &chain {
             let base_offset = self.cluster_offset(cluster)?;

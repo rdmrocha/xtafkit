@@ -403,13 +403,59 @@ fn test_rename_preserves_data() {
     assert_eq!(read, original_data);
 }
 
+#[test]
+fn test_rename_rejects_destination_collision() {
+    let (_tmp, mut vol) = common::create_fatx_image(2);
+
+    vol.create_file("/a.txt", b"aaa").expect("create a");
+    vol.create_file("/b.txt", b"bbb").expect("create b");
+
+    let result = vol.rename("/a.txt", "b.txt");
+    assert!(
+        matches!(result, Err(FatxError::FileExists(ref path)) if path == "/b.txt"),
+        "expected destination collision, got {:?}",
+        result
+    );
+
+    assert_eq!(vol.read_file_by_path("/a.txt").expect("read a"), b"aaa");
+    assert_eq!(vol.read_file_by_path("/b.txt").expect("read b"), b"bbb");
+}
+
+#[test]
+fn test_rename_same_name_is_noop() {
+    let (_tmp, mut vol) = common::create_fatx_image(2);
+
+    vol.create_file("/a.txt", b"payload").expect("create");
+    vol.rename("/a.txt", "a.txt").expect("rename noop");
+
+    assert_eq!(
+        vol.read_file_by_path("/a.txt").expect("read after noop"),
+        b"payload"
+    );
+}
+
+#[test]
+fn test_rename_case_only_changes_filename() {
+    let (_tmp, mut vol) = common::create_fatx_image(2);
+
+    vol.create_file("/a.txt", b"payload").expect("create");
+    vol.rename("/a.txt", "A.TXT").expect("rename case-only");
+
+    let entry = vol.resolve_path("/A.TXT").expect("resolve renamed");
+    assert_eq!(entry.filename(), "A.TXT");
+    assert_eq!(
+        vol.read_file_by_path("/A.TXT").expect("read renamed"),
+        b"payload"
+    );
+}
+
 // ===========================================================================
 // Volume stats
 // ===========================================================================
 
 #[test]
 fn test_volume_stats() {
-    let (_tmp, mut vol) = common::create_fatx_image(2);
+    let (_tmp, vol) = common::create_fatx_image(2);
 
     let stats = vol.stats().expect("stats");
     assert!(stats.total_clusters > 0);
@@ -848,6 +894,63 @@ fn test_write_in_place_updates_dirent_size() {
 }
 
 #[test]
+fn test_read_chain_rejects_out_of_range_next_cluster() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    vol.create_file("/corrupt.bin", &[0xAA; 100])
+        .expect("create");
+    let entry = vol.resolve_path("/corrupt.bin").expect("resolve");
+    let invalid_next = FIRST_CLUSTER + vol.total_clusters + 5;
+    vol.write_fat_entry(entry.first_cluster, FatEntry::Next(invalid_next))
+        .expect("corrupt fat entry");
+
+    let result = vol.read_chain(entry.first_cluster);
+    assert!(
+        matches!(result, Err(FatxError::CorruptChain(c)) if c == entry.first_cluster),
+        "expected corrupt chain for out-of-range next, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_read_chain_rejects_next_cluster_at_exact_upper_bound() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    vol.create_file("/boundary.bin", &[0xAB; 100])
+        .expect("create");
+    let entry = vol.resolve_path("/boundary.bin").expect("resolve");
+    let invalid_next = FIRST_CLUSTER + vol.total_clusters;
+    vol.write_fat_entry(entry.first_cluster, FatEntry::Next(invalid_next))
+        .expect("corrupt fat entry");
+
+    let result = vol.read_chain(entry.first_cluster);
+    assert!(
+        matches!(result, Err(FatxError::CorruptChain(c)) if c == entry.first_cluster),
+        "expected corrupt chain for exact-boundary next, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_read_chain_rejects_cycle() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    let first = vol.allocate_chain(2).expect("allocate chain");
+    let chain = vol.read_chain(first).expect("read allocated chain");
+    assert_eq!(chain.len(), 2);
+
+    vol.write_fat_entry(chain[1], FatEntry::Next(chain[0]))
+        .expect("create cycle");
+
+    let result = vol.read_chain(first);
+    assert!(
+        matches!(result, Err(FatxError::CorruptChain(c)) if c == chain[0] || c == chain[1]),
+        "expected corrupt chain for cycle, got {:?}",
+        result
+    );
+}
+
+#[test]
 fn test_write_in_place_refreshes_write_and_access_timestamps() {
     let (_tmp, mut vol) = common::create_fatx_image(4);
 
@@ -919,7 +1022,7 @@ fn test_write_in_place_repeated_overwrites() {
         let size = (i as usize) * 1000;
         let data = vec![i; size];
         vol.write_file_in_place("/cycle.bin", &data)
-            .expect(&format!("write cycle {}", i));
+            .unwrap_or_else(|_| panic!("write cycle {}", i));
 
         let read_back = vol.read_file_by_path("/cycle.bin").expect("read");
         assert_eq!(read_back.len(), size);
@@ -954,6 +1057,112 @@ fn test_write_in_place_nonexistent_fails() {
 
     let result = vol.write_file_in_place("/nope.bin", &[0xFF; 100]);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_begin_write_in_place_partial_extension_write_does_not_publish_size() {
+    let (tmp, mut vol) = common::create_fatx_image(4);
+
+    let original = vec![0x21; 100];
+    vol.create_file("/session-grow.bin", &original)
+        .expect("create");
+
+    let cluster_size = vol.superblock.cluster_size() as usize;
+    let first_cluster = vol
+        .resolve_path("/session-grow.bin")
+        .expect("resolve grow session file")
+        .first_cluster;
+    let session = vol
+        .begin_write_in_place_for_entry(FIRST_CLUSTER, first_cluster, cluster_size * 5)
+        .expect("begin session");
+    assert_eq!(
+        session.clusters().len(),
+        5,
+        "grow session should reserve target chain"
+    );
+
+    let extension_cluster = session.clusters()[1];
+    let extension_payload = vec![0x7A; cluster_size];
+    vol.write_cluster(extension_cluster, &extension_payload)
+        .expect("write extension cluster");
+    vol.flush().expect("flush uncommitted session");
+
+    let image = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(common::image_path(&tmp))
+        .expect("reopen image");
+    let mut reopened = FatxVolume::open(image, 0, 0).expect("open volume");
+
+    let entry = reopened
+        .resolve_path("/session-grow.bin")
+        .expect("resolve after partial write");
+    assert_eq!(
+        entry.file_size,
+        original.len() as u32,
+        "session writes must not publish a larger file size before commit"
+    );
+    assert_eq!(
+        reopened
+            .read_file_by_path("/session-grow.bin")
+            .expect("read after partial write"),
+        original
+    );
+    drop(reopened);
+
+    vol.cancel_write_session(session).expect("cancel session");
+    vol.flush().expect("flush cancel");
+}
+
+#[test]
+fn test_cancel_write_session_releases_extension_and_preserves_visible_file() {
+    let (tmp, mut vol) = common::create_fatx_image(4);
+
+    let original = vec![0x44; 100];
+    vol.create_file("/session-cancel.bin", &original)
+        .expect("create");
+    let before = vol.stats().expect("stats before");
+
+    let cluster_size = vol.superblock.cluster_size() as usize;
+    let first_cluster = vol
+        .resolve_path("/session-cancel.bin")
+        .expect("resolve cancel session file")
+        .first_cluster;
+    let session = vol
+        .begin_write_in_place_for_entry(FIRST_CLUSTER, first_cluster, cluster_size * 4)
+        .expect("begin session");
+    let extension_cluster = session.clusters()[1];
+    vol.write_cluster(extension_cluster, &vec![0x55; cluster_size])
+        .expect("write extension cluster");
+    vol.flush().expect("flush uncommitted session");
+
+    vol.cancel_write_session(session).expect("cancel session");
+    vol.flush().expect("flush cancel");
+    drop(vol);
+
+    let image = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(common::image_path(&tmp))
+        .expect("reopen image");
+    let mut reopened = FatxVolume::open(image, 0, 0).expect("open volume");
+
+    let entry = reopened
+        .resolve_path("/session-cancel.bin")
+        .expect("resolve after cancel");
+    assert_eq!(entry.file_size, original.len() as u32);
+    assert_eq!(
+        reopened
+            .read_file_by_path("/session-cancel.bin")
+            .expect("read after cancel"),
+        original
+    );
+
+    let after = reopened.stats().expect("stats after");
+    assert_eq!(
+        after.free_clusters, before.free_clusters,
+        "cancelling a grow session should release reserved extension clusters"
+    );
 }
 
 // ===========================================================================
@@ -1109,6 +1318,8 @@ fn test_create_file_frees_allocated_clusters_on_dirent_write_failure() {
     let mut vol = FatxVolume::open(cursor, 0, 0).expect("open with failing cursor");
 
     let stats_before = vol.stats().expect("stats before");
+    // write #1 initializes the new directory cluster; write #2 persists the
+    // parent directory entry, which is the rollback edge we want here.
     state.borrow_mut().fail_on_write = Some(2);
 
     let result = vol.create_file("/leak.bin", b"abc");
@@ -1125,6 +1336,94 @@ fn test_create_file_frees_allocated_clusters_on_dirent_write_failure() {
     assert!(
         matches!(
             vol.resolve_path("/leak.bin"),
+            Err(FatxError::FileNotFound(_))
+        ),
+        "failed create should not leave a reachable directory entry"
+    );
+}
+
+#[test]
+fn test_create_directory_frees_allocated_cluster_on_dirent_write_failure() {
+    let (tmp, vol) = common::create_fatx_image(4);
+    let img_path = common::image_path(&tmp);
+    drop(vol);
+
+    let image_bytes = std::fs::read(&img_path).expect("read image bytes");
+    let state = Rc::new(RefCell::new(FailingWriteState::default()));
+    let cursor = FailingWriteCursor {
+        inner: Cursor::new(image_bytes),
+        state: Rc::clone(&state),
+    };
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open with failing cursor");
+
+    let stats_before = vol.stats().expect("stats before");
+    state.borrow_mut().fail_on_write = Some(2);
+
+    let result = vol.create_directory("/broken");
+    assert!(
+        result.is_err(),
+        "injected write failure should abort directory create"
+    );
+
+    let stats_after = vol.stats().expect("stats after");
+    assert_eq!(
+        stats_after.free_clusters, stats_before.free_clusters,
+        "failed mkdir should free the allocated directory cluster"
+    );
+    assert!(
+        matches!(vol.resolve_path("/broken"), Err(FatxError::FileNotFound(_))),
+        "failed mkdir should not leave a reachable directory entry"
+    );
+}
+
+#[test]
+fn test_directory_growth_failure_rolls_back_new_parent_cluster() {
+    let (tmp, mut vol) = common::create_fatx_image(8);
+
+    vol.create_directory("/full").expect("mkdir");
+    for i in 0..256 {
+        let name = format!("/full/f{:03}.bin", i);
+        vol.create_file(&name, &[i as u8]).expect("fill full dir");
+    }
+    let parent_cluster = vol
+        .resolve_path("/full")
+        .expect("resolve full")
+        .first_cluster;
+    let parent_chain_before = vol.read_chain(parent_cluster).expect("parent chain before");
+    let stats_before = vol.stats().expect("stats before");
+    vol.flush().expect("flush populated image");
+
+    let img_path = common::image_path(&tmp);
+    drop(vol);
+
+    let image_bytes = std::fs::read(&img_path).expect("read image bytes");
+    let state = Rc::new(RefCell::new(FailingWriteState::default()));
+    let cursor = FailingWriteCursor {
+        inner: Cursor::new(image_bytes),
+        state: Rc::clone(&state),
+    };
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open with failing cursor");
+    state.borrow_mut().fail_on_write = Some(2);
+
+    let result = vol.create_file("/full/overflow.bin", b"x");
+    assert!(
+        result.is_err(),
+        "injected write failure should abort create in expanded dir"
+    );
+
+    let stats_after = vol.stats().expect("stats after");
+    assert_eq!(
+        stats_after.free_clusters, stats_before.free_clusters,
+        "failed directory expansion should free both file data and parent dir clusters"
+    );
+    assert_eq!(
+        vol.read_chain(parent_cluster).expect("parent chain after"),
+        parent_chain_before,
+        "failed directory expansion should restore the parent directory chain"
+    );
+    assert!(
+        matches!(
+            vol.resolve_path("/full/overflow.bin"),
             Err(FatxError::FileNotFound(_))
         ),
         "failed create should not leave a reachable directory entry"

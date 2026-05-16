@@ -89,21 +89,19 @@ pub fn create_fatx_image(size_mb: u32) -> (TempDir, FatxVolume<File>) {
 }
 
 /// Create a blank XTAF (big-endian, Xbox 360) image.
+#[allow(dead_code)]
 pub fn create_xtaf_image(size_mb: u32) -> (TempDir, FatxVolume<File>) {
     create_image(size_mb, "xtaf", false)
 }
 
 /// Create a FATX image populated with sample Xbox-like content.
+#[allow(dead_code)]
 pub fn create_populated_image(size_mb: u32) -> (TempDir, FatxVolume<File>) {
     create_image(size_mb, "fatx", true)
 }
 
-/// Create a populated XTAF image.
-pub fn create_populated_xtaf_image(size_mb: u32) -> (TempDir, FatxVolume<File>) {
-    create_image(size_mb, "xtaf", true)
-}
-
 /// Get just the image file path from a TempDir (for CLI tests that need the path).
+#[allow(dead_code)]
 pub fn image_path(tmp_dir: &TempDir) -> PathBuf {
     tmp_dir.path().join("test.img")
 }

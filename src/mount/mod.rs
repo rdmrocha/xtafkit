@@ -3,6 +3,7 @@
 //! Starts a localhost NFSv3 server backed by a FATX volume, then mounts it
 //! so it appears as a regular volume in Finder.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
@@ -156,9 +157,16 @@ fn root_fattr() -> fattr3 {
     }
 }
 
-/// Dirty write buffer: cluster -> (fatx_path, buffered_data).
+#[derive(Clone, Debug)]
+struct DirtyFileState {
+    parent_cluster: u32,
+    first_cluster: u32,
+    data: Vec<u8>,
+}
+
+/// Dirty write buffer: first_cluster -> buffered file state.
 /// Writes accumulate here in memory and get flushed to disk periodically.
-type DirtyFileMap = HashMap<u32, (String, Vec<u8>)>;
+type DirtyFileMap = HashMap<u32, DirtyFileState>;
 
 /// The NFS filesystem backed by a FatxVolume.
 ///
@@ -296,6 +304,66 @@ impl FatxNfs {
         }
         parts.reverse();
         format!("/{}", parts.join("/"))
+    }
+
+    fn dirty_state_is_in_subtree(
+        parents: &HashMap<u32, (u32, String)>,
+        state: &DirtyFileState,
+        root_cluster: u32,
+    ) -> bool {
+        if state.first_cluster == root_cluster {
+            return true;
+        }
+
+        let mut current = state.parent_cluster;
+        loop {
+            if current == root_cluster {
+                return true;
+            }
+            if current == FIRST_CLUSTER {
+                return false;
+            }
+            let Some((parent, _name)) = parents.get(&current) else {
+                return false;
+            };
+            current = *parent;
+        }
+    }
+
+    fn purge_dirty_subtree(&self, root_cluster: u32) {
+        let to_remove = {
+            let parents = self.inode_parents.read();
+            let dirty = self.dirty_files.lock();
+            dirty
+                .iter()
+                .filter_map(|(&cluster, state)| {
+                    // inode_parents is opportunistic and may be incomplete for
+                    // untouched ancestors. Purge the subtree entries we can
+                    // prove belong here; any missed stale buffers are still
+                    // dropped later because identity-based flush refuses to
+                    // recreate missing dirents.
+                    if Self::dirty_state_is_in_subtree(&parents, state, root_cluster) {
+                        Some(cluster)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if to_remove.is_empty() {
+            return;
+        }
+
+        {
+            let mut dirty = self.dirty_files.lock();
+            for cluster in &to_remove {
+                dirty.remove(cluster);
+            }
+        }
+        for cluster in to_remove {
+            self.file_cache.remove(&cluster);
+        }
     }
 
     /// Check if a filename is macOS metadata that should be silently rejected.
@@ -451,8 +519,8 @@ impl NFSFileSystem for FatxNfs {
         // cloning the whole file into the read cache on every chunk.
         {
             let dirty = self.dirty_files.lock();
-            if let Some((_, buffered)) = dirty.get(&cluster) {
-                return Ok(slice_buffered_range(buffered, offset, count));
+            if let Some(state) = dirty.get(&cluster) {
+                return Ok(slice_buffered_range(&state.data, offset, count));
             }
         }
 
@@ -564,32 +632,84 @@ impl NFSFileSystem for FatxNfs {
             entries.into_iter().find(|e| e.first_cluster == cluster)
         };
         let entry = entry.ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        let path = self.resolve_fatx_path(cluster_to_id(parent_cluster), &entry.filename());
+
+        let needs_seed = {
+            let dirty = self.dirty_files.lock();
+            dirty.get(&cluster).is_none()
+        };
+
+        let prefetched_seed = if needs_seed {
+            if let Some(cached) = self.file_cache.get(&cluster) {
+                Some(cached.to_vec())
+            } else {
+                let vol = Arc::clone(&self.vol);
+                let entry = entry.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        let mut vol = vol.write();
+                        vol.read_file(&entry).map_err(|e| {
+                            warn!(
+                                "seed read for cluster {} failed: {}",
+                                entry.first_cluster, e
+                            );
+                            nfsstat3::NFS3ERR_IO
+                        })
+                    })
+                    .await
+                    .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?,
+                )
+            }
+        } else {
+            None
+        };
 
         // Buffer the write in memory — NO disk I/O here.
         // The periodic flush task will write dirty files to disk.
-        {
+        let mut prefetched_seed = prefetched_seed;
+        loop {
             let mut dirty = self.dirty_files.lock();
-            let buf = dirty.entry(cluster).or_insert_with(|| {
-                // First write to this file — seed from file_cache or empty
-                let cached = self.file_cache.get(&cluster);
-                let existing = if let Some(c) = cached {
-                    c.to_vec()
-                } else {
-                    // Need to read from disk (blocking) — but only once per file
-                    let mut vol = self.vol.write();
-                    vol.read_file(&entry).unwrap_or_default()
-                };
-                (path.clone(), existing)
-            });
+            match dirty.entry(cluster) {
+                Entry::Occupied(mut entry) => {
+                    let buf = entry.get_mut();
+                    let write_end = offset as usize + data.len();
+                    if write_end > buf.data.len() {
+                        buf.data.resize(write_end, 0);
+                    }
+                    buf.data[offset as usize..write_end].copy_from_slice(data);
+                    break;
+                }
+                Entry::Vacant(entry) => {
+                    // We intentionally re-check here after prefetching outside the lock.
+                    // Another writer may have inserted the dirty buffer while we were
+                    // reading from cache/disk, in which case the Occupied arm wins and
+                    // this prefetched seed is discarded instead of clobbering newer data.
+                    let Some(seed) = prefetched_seed.take() else {
+                        drop(dirty);
+                        prefetched_seed =
+                            self.file_cache.get(&cluster).map(|cached| cached.to_vec());
+                        if prefetched_seed.is_some() {
+                            continue;
+                        }
+                        warn!(
+                            "seed buffer for cluster {} disappeared before insert; returning I/O error",
+                            cluster
+                        );
+                        return Err(nfsstat3::NFS3ERR_IO);
+                    };
 
-            let write_end = offset as usize + data.len();
-            if write_end > buf.1.len() {
-                buf.1.resize(write_end, 0);
+                    let buf = entry.insert(DirtyFileState {
+                        parent_cluster,
+                        first_cluster: cluster,
+                        data: seed,
+                    });
+                    let write_end = offset as usize + data.len();
+                    if write_end > buf.data.len() {
+                        buf.data.resize(write_end, 0);
+                    }
+                    buf.data[offset as usize..write_end].copy_from_slice(data);
+                    break;
+                }
             }
-            buf.1[offset as usize..write_end].copy_from_slice(data);
-            // Update path in case it changed
-            buf.0 = path;
         }
 
         self.flush_needed.store(true, Ordering::Relaxed);
@@ -661,8 +781,53 @@ impl NFSFileSystem for FatxNfs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        let (id, _) = self.create(dirid, filename, sattr3::default()).await?;
-        Ok(id)
+        let t0 = Instant::now();
+        self.check_writable()?;
+
+        let name_str =
+            std::str::from_utf8(filename.as_ref()).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+        info!("NFS create exclusive: dir={} name=\"{}\"", dirid, name_str);
+
+        let path = self.resolve_fatx_path(dirid, name_str);
+        let parent_cluster = id_to_cluster(dirid);
+
+        let vol = Arc::clone(&self.vol);
+        let path_clone = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut vol = vol.write();
+            match vol.create_file(&path_clone, &[]) {
+                Ok(()) => Ok::<(), nfsstat3>(()),
+                Err(fatxlib::error::FatxError::FileExists(_)) => Err(nfsstat3::NFS3ERR_EXIST),
+                Err(e) => {
+                    warn!("create exclusive '{}': {}", path_clone, e);
+                    Err(nfsstat3::NFS3ERR_IO)
+                }
+            }
+        })
+        .await
+        .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?;
+
+        self.flush_needed.store(true, Ordering::Relaxed);
+        self.invalidate_dir(parent_cluster);
+
+        let entries = self.get_dir_entries(parent_cluster).await?;
+        for entry in &entries {
+            if entry.filename().eq_ignore_ascii_case(name_str) {
+                info!(
+                    "NFS create exclusive: \"{}\" -> id={} ({:.1}ms)",
+                    name_str,
+                    cluster_to_id(entry.first_cluster),
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+                return Ok(cluster_to_id(entry.first_cluster));
+            }
+        }
+
+        error!(
+            "NFS create exclusive: \"{}\" created but not found in dir listing!",
+            name_str
+        );
+        Err(nfsstat3::NFS3ERR_IO)
     }
 
     async fn mkdir(
@@ -767,10 +932,9 @@ impl NFSFileSystem for FatxNfs {
         .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?;
 
         if let Some(cluster) = removed_cluster {
-            // Drop any delayed-write state for the deleted file so the periodic
-            // flush cannot recreate it after the delete has succeeded.
-            self.dirty_files.lock().remove(&cluster);
-            self.file_cache.remove(&cluster);
+            // Drop any delayed-write state for the deleted subtree so the
+            // periodic flush cannot recreate files after the delete succeeds.
+            self.purge_dirty_subtree(cluster);
         }
 
         self.flush_needed.store(true, Ordering::Relaxed);
@@ -1433,19 +1597,17 @@ async fn async_main(cli: MountArgs) {
                     let t0 = Instant::now();
 
                     // Drain all dirty files
-                    let pending: Vec<(u32, String, Vec<u8>)> = {
+                    let pending: Vec<DirtyFileState> = {
                         let mut dirty = dirty.lock();
                         let taken = std::mem::take(&mut *dirty);
-                        for (cluster, (_path, data)) in &taken {
+                        for state in taken.values() {
                             // Publish the buffered view once per flush cycle so
                             // reads stay coherent while cluster writes are in
                             // flight after `dirty_files` has been drained.
-                            file_cache.insert(*cluster, Bytes::copy_from_slice(data));
+                            file_cache
+                                .insert(state.first_cluster, Bytes::copy_from_slice(&state.data));
                         }
-                        taken
-                            .into_iter()
-                            .map(|(cluster, (path, data))| (cluster, path, data))
-                            .collect()
+                        taken.into_values().collect()
                     };
 
                     if !pending.is_empty() {
@@ -1455,24 +1617,31 @@ async fn async_main(cli: MountArgs) {
                         // The vol lock is held briefly for FAT chain management,
                         // then released between each cluster write so NFS reads
                         // (Finder browsing) can interleave.
-                        for (_cluster, path, data) in pending {
+                        for state in pending {
                             let ft = Instant::now();
-                            let data_len = data.len();
+                            let data_len = state.data.len();
 
-                            // Phase 1: Prepare chain (fast FAT ops — brief lock)
-                            let chain = {
+                            // Phase 1: Prepare chain using stable file identity.
+                            let session = {
                                 let mut vol = vol.write();
-                                match vol.prepare_write_in_place(&path, data.len()) {
-                                    Ok(chain) => chain,
+                                match vol.begin_write_in_place_for_entry(
+                                    state.parent_cluster,
+                                    state.first_cluster,
+                                    state.data.len(),
+                                ) {
+                                    Ok(session) => session,
                                     Err(fatxlib::error::FatxError::FileNotFound(_)) => {
-                                        // File doesn't exist — create it (holds lock for full write)
-                                        if let Err(e) = vol.create_or_replace_file(&path, &data) {
-                                            error!("Flush create '{}' failed: {}", path, e);
-                                        }
+                                        info!(
+                                            "Dropping dirty buffer for deleted/missing cluster {}",
+                                            state.first_cluster
+                                        );
                                         continue;
                                     }
                                     Err(e) => {
-                                        error!("Flush prepare '{}' failed: {}", path, e);
+                                        error!(
+                                            "Flush prepare cluster {} failed: {}",
+                                            state.first_cluster, e
+                                        );
                                         continue;
                                     }
                                 }
@@ -1485,30 +1654,55 @@ async fn async_main(cli: MountArgs) {
                                 vol.superblock.cluster_size() as usize
                             };
                             let mut offset = 0usize;
-                            for &c in &chain {
-                                let end = (offset + cluster_size).min(data.len());
+                            let mut write_failed = false;
+                            for &c in session.clusters() {
+                                let end = (offset + cluster_size).min(state.data.len());
                                 let mut cluster_buf = vec![0u8; cluster_size];
-                                if offset < data.len() {
+                                if offset < state.data.len() {
                                     let len = end - offset;
-                                    cluster_buf[..len].copy_from_slice(&data[offset..end]);
+                                    cluster_buf[..len].copy_from_slice(&state.data[offset..end]);
                                 }
                                 {
                                     let mut vol = vol.write();
                                     if let Err(e) = vol.write_cluster(c, &cluster_buf) {
-                                        error!("Flush cluster {} for '{}' failed: {}", c, path, e);
+                                        error!(
+                                            "Flush cluster {} for file {} failed: {}",
+                                            c, state.first_cluster, e
+                                        );
+                                        write_failed = true;
                                         break;
                                     }
                                 }
                                 // Lock released — NFS reads can proceed
                                 offset += cluster_size;
-                                if offset >= data.len() {
+                                if offset >= state.data.len() {
                                     break;
                                 }
                             }
 
+                            {
+                                let mut vol = vol.write();
+                                if write_failed {
+                                    if let Err(e) = vol.cancel_write_session(session) {
+                                        error!(
+                                            "Flush cancel cluster {} failed: {}",
+                                            state.first_cluster, e
+                                        );
+                                    }
+                                    continue;
+                                }
+                                if let Err(e) = vol.commit_write_session(session) {
+                                    error!(
+                                        "Flush commit cluster {} failed: {}",
+                                        state.first_cluster, e
+                                    );
+                                    continue;
+                                }
+                            }
+
                             info!(
-                                "Flushed '{}' ({} bytes, {:.1}ms)",
-                                path,
+                                "Flushed cluster {} ({} bytes, {:.1}ms)",
+                                state.first_cluster,
                                 data_len,
                                 ft.elapsed().as_secs_f64() * 1000.0
                             );
@@ -1779,7 +1973,7 @@ async fn async_main(cli: MountArgs) {
             // Step 2: Flush dirty files and FAT if needed
             if shutdown_flush_flag.load(Ordering::Relaxed) {
                 // Drain dirty write buffers to disk
-                let pending: HashMap<u32, (String, Vec<u8>)> = {
+                let pending: HashMap<u32, DirtyFileState> = {
                     let mut dirty = shutdown_dirty.lock();
                     std::mem::take(&mut *dirty)
                 };
@@ -1790,19 +1984,60 @@ async fn async_main(cli: MountArgs) {
                     );
                     {
                         let mut vol = shutdown_vol.write();
-                        for (path, data) in pending.values() {
-                            // Try in-place write; fall back to delete+recreate.
-                            // The fallback uses delete + create_file directly because
-                            // write_file_in_place already failed — create_or_replace_file
-                            // would just call it again with the same result.
-                            match vol.write_file_in_place(path, data) {
-                                Ok(()) => {}
-                                Err(_) => {
-                                    let _ = vol.delete(path);
-                                    if let Err(e) = vol.create_file(path, data) {
-                                        eprintln!("[shutdown] Failed to flush '{}': {}", path, e);
+                        for state in pending.values() {
+                            match vol.begin_write_in_place_for_entry(
+                                state.parent_cluster,
+                                state.first_cluster,
+                                state.data.len(),
+                            ) {
+                                Ok(session) => {
+                                    let cluster_size = vol.superblock.cluster_size() as usize;
+                                    let mut offset = 0usize;
+                                    let mut write_failed = false;
+                                    for &cluster in session.clusters() {
+                                        let end = (offset + cluster_size).min(state.data.len());
+                                        let mut cluster_buf = vec![0u8; cluster_size];
+                                        if offset < state.data.len() {
+                                            let len = end - offset;
+                                            cluster_buf[..len]
+                                                .copy_from_slice(&state.data[offset..end]);
+                                        }
+                                        if let Err(e) = vol.write_cluster(cluster, &cluster_buf) {
+                                            eprintln!(
+                                                "[shutdown] Failed to write cluster {} for file {}: {}",
+                                                cluster, state.first_cluster, e
+                                            );
+                                            write_failed = true;
+                                            break;
+                                        }
+                                        offset += cluster_size;
+                                        if offset >= state.data.len() {
+                                            break;
+                                        }
+                                    }
+
+                                    if write_failed {
+                                        if let Err(e) = vol.cancel_write_session(session) {
+                                            eprintln!(
+                                                "[shutdown] Failed to cancel pending write for cluster {}: {}",
+                                                state.first_cluster, e
+                                            );
+                                        }
+                                    } else if let Err(e) = vol.commit_write_session(session) {
+                                        eprintln!(
+                                            "[shutdown] Failed to commit pending write for cluster {}: {}",
+                                            state.first_cluster, e
+                                        );
                                     }
                                 }
+                                Err(fatxlib::error::FatxError::FileNotFound(_)) => eprintln!(
+                                    "[shutdown] Dropping dirty buffer for deleted/missing cluster {}",
+                                    state.first_cluster
+                                ),
+                                Err(e) => eprintln!(
+                                    "[shutdown] Failed to prepare dirty file {}: {}",
+                                    state.first_cluster, e
+                                ),
                             }
                         }
                         // Dir cache entries don't need clearing at shutdown
@@ -1862,6 +2097,32 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mkimage::{run as run_mkimage, MkimageArgs};
+    use fatxlib::FatEntry;
+    use std::fs::OpenOptions;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn create_test_nfs() -> (TempDir, PathBuf, FatxNfs) {
+        let tmp = TempDir::new().expect("tempdir");
+        let image_path = tmp.path().join("mount-test.img");
+        run_mkimage(MkimageArgs {
+            output: image_path.clone(),
+            size: "16M".to_string(),
+            format: "fatx".to_string(),
+            spc: 32,
+            populate: false,
+            force: true,
+        });
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image_path)
+            .expect("open image");
+        let vol = FatxVolume::open(file, 0, 0).expect("open FATX volume");
+        (tmp, image_path, FatxNfs::new(vol, false))
+    }
 
     // ── is_macos_metadata tests ──
 
@@ -1954,5 +2215,211 @@ mod tests {
         let (slice, eof) = slice_buffered_range(data, 9, 1);
         assert_eq!(slice, b"j");
         assert!(eof);
+    }
+
+    #[test]
+    fn test_identity_flush_survives_ancestor_directory_rename() {
+        let (_tmp, _image_path, fs) = create_test_nfs();
+
+        let (dir_cluster, file_cluster) = {
+            let mut vol = fs.vol.write();
+            vol.create_directory("/Dir").expect("mkdir");
+            vol.create_file("/Dir/file.bin", b"old")
+                .expect("create file");
+
+            let dir_cluster = vol.resolve_path("/Dir").expect("resolve dir").first_cluster;
+            let file_cluster = vol
+                .resolve_path("/Dir/file.bin")
+                .expect("resolve file")
+                .first_cluster;
+
+            vol.rename("/Dir", "RenamedDir").expect("rename dir");
+            (dir_cluster, file_cluster)
+        };
+
+        {
+            let mut parents = fs.inode_parents.write();
+            parents.insert(dir_cluster, (FIRST_CLUSTER, "Dir".to_string()));
+            parents.insert(file_cluster, (dir_cluster, "file.bin".to_string()));
+        }
+
+        let state = DirtyFileState {
+            parent_cluster: dir_cluster,
+            first_cluster: file_cluster,
+            data: b"updated".to_vec(),
+        };
+
+        {
+            let mut vol = fs.vol.write();
+            let session = vol
+                .begin_write_in_place_for_entry(
+                    state.parent_cluster,
+                    state.first_cluster,
+                    state.data.len(),
+                )
+                .expect("begin session");
+            let cluster_size = vol.superblock.cluster_size() as usize;
+            let mut offset = 0usize;
+            for &cluster in session.clusters() {
+                let end = (offset + cluster_size).min(state.data.len());
+                let mut cluster_buf = vec![0u8; cluster_size];
+                if offset < state.data.len() {
+                    let len = end - offset;
+                    cluster_buf[..len].copy_from_slice(&state.data[offset..end]);
+                }
+                vol.write_cluster(cluster, &cluster_buf)
+                    .expect("write cluster");
+                offset += cluster_size;
+                if offset >= state.data.len() {
+                    break;
+                }
+            }
+            vol.commit_write_session(session).expect("commit session");
+            vol.flush().expect("flush");
+        }
+
+        let mut vol = fs.vol.write();
+        assert!(vol.resolve_path("/Dir/file.bin").is_err());
+        assert_eq!(
+            vol.read_file_by_path("/RenamedDir/file.bin")
+                .expect("read renamed file"),
+            b"updated"
+        );
+    }
+
+    #[test]
+    fn test_purge_dirty_subtree_removes_descendants() {
+        let (_tmp, _image_path, fs) = create_test_nfs();
+
+        {
+            let mut parents = fs.inode_parents.write();
+            parents.insert(10, (FIRST_CLUSTER, "Dir".to_string()));
+            parents.insert(11, (10, "Nested".to_string()));
+            parents.insert(20, (10, "child.bin".to_string()));
+            parents.insert(21, (11, "grandchild.bin".to_string()));
+            parents.insert(30, (FIRST_CLUSTER, "keep.bin".to_string()));
+        }
+
+        {
+            let mut dirty = fs.dirty_files.lock();
+            dirty.insert(
+                20,
+                DirtyFileState {
+                    parent_cluster: 10,
+                    first_cluster: 20,
+                    data: vec![1, 2, 3],
+                },
+            );
+            dirty.insert(
+                21,
+                DirtyFileState {
+                    parent_cluster: 11,
+                    first_cluster: 21,
+                    data: vec![4, 5, 6],
+                },
+            );
+            dirty.insert(
+                30,
+                DirtyFileState {
+                    parent_cluster: FIRST_CLUSTER,
+                    first_cluster: 30,
+                    data: vec![7, 8, 9],
+                },
+            );
+        }
+        fs.file_cache.insert(20, Bytes::from_static(b"child"));
+        fs.file_cache.insert(21, Bytes::from_static(b"grandchild"));
+        fs.file_cache.insert(30, Bytes::from_static(b"keep"));
+
+        fs.purge_dirty_subtree(10);
+
+        let dirty = fs.dirty_files.lock();
+        assert!(!dirty.contains_key(&20));
+        assert!(!dirty.contains_key(&21));
+        assert!(dirty.contains_key(&30));
+        drop(dirty);
+
+        assert!(fs.file_cache.get(&20).is_none());
+        assert!(fs.file_cache.get(&21).is_none());
+        assert!(fs.file_cache.get(&30).is_some());
+    }
+
+    #[test]
+    fn test_create_exclusive_rejects_existing_file_without_truncating() {
+        let (_tmp, _image_path, fs) = create_test_nfs();
+
+        {
+            let mut vol = fs.vol.write();
+            vol.create_file("/exists.bin", b"original")
+                .expect("create existing file");
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let result = rt.block_on(async {
+            fs.create_exclusive(ROOT_FILEID, &b"exists.bin".to_vec().into())
+                .await
+        });
+
+        assert!(matches!(result, Err(nfsstat3::NFS3ERR_EXIST)));
+
+        let mut vol = fs.vol.write();
+        assert_eq!(
+            vol.read_file_by_path("/exists.bin")
+                .expect("read existing file"),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn test_write_seeds_from_disk_on_cache_miss() {
+        let (_tmp, _image_path, fs) = create_test_nfs();
+
+        let file_id = {
+            let mut vol = fs.vol.write();
+            vol.create_file("/seed.bin", b"abcdef")
+                .expect("create seed file");
+            let entry = vol.resolve_path("/seed.bin").expect("resolve seed file");
+            fs.inode_parents
+                .write()
+                .insert(entry.first_cluster, (FIRST_CLUSTER, "seed.bin".to_string()));
+            cluster_to_id(entry.first_cluster)
+        };
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let attr = rt.block_on(async { fs.write(file_id, 0, b"ZZ").await });
+        assert!(attr.is_ok(), "write should succeed on cache miss");
+
+        let dirty = fs.dirty_files.lock();
+        let state = dirty.get(&id_to_cluster(file_id)).expect("dirty buffer");
+        assert_eq!(state.data, b"ZZcdef");
+    }
+
+    #[test]
+    fn test_write_returns_io_if_seed_read_fails() {
+        let (_tmp, _image_path, fs) = create_test_nfs();
+
+        let file_id = {
+            let mut vol = fs.vol.write();
+            vol.create_file("/broken.bin", b"abcdef")
+                .expect("create broken file");
+            let entry = vol
+                .resolve_path("/broken.bin")
+                .expect("resolve broken file");
+            vol.write_fat_entry(entry.first_cluster, FatEntry::Free)
+                .expect("corrupt chain");
+            fs.inode_parents.write().insert(
+                entry.first_cluster,
+                (FIRST_CLUSTER, "broken.bin".to_string()),
+            );
+            cluster_to_id(entry.first_cluster)
+        };
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let result = rt.block_on(async { fs.write(file_id, 0, b"ZZ").await });
+        assert!(matches!(result, Err(nfsstat3::NFS3ERR_IO)));
+        assert!(
+            !fs.dirty_files.lock().contains_key(&id_to_cluster(file_id)),
+            "failed seed read must not create a dirty buffer"
+        );
     }
 }

@@ -443,11 +443,12 @@ mod tests {
                 .expect("open");
 
             let size = 8 * 1024 * 1024;
-            format_image(&mut file, size, false, spc).expect(&format!("format spc={}", spc));
+            format_image(&mut file, size, false, spc)
+                .unwrap_or_else(|_| panic!("format spc={}", spc));
 
             drop(file);
             let f = File::open(&path).expect("reopen");
-            FatxVolume::open(f, 0, 0).expect(&format!("valid volume spc={}", spc));
+            FatxVolume::open(f, 0, 0).unwrap_or_else(|_| panic!("valid volume spc={}", spc));
         }
     }
 
