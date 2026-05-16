@@ -10,7 +10,7 @@
 #   bash install.sh
 #
 # Options:
-#   FATX_VERSION=v0.2.0 bash install.sh           # install a specific version
+#   FATX_VERSION=v0.3.0 bash install.sh           # install a specific version
 #   FATX_INSTALL_DIR=~/.local/bin bash install.sh  # custom install directory
 
 set -e

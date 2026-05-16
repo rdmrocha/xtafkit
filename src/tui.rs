@@ -5,18 +5,23 @@
 //! - I/O thread: owns FatxVolume, executes commands, sends responses
 //!
 //! Keyboard:
-//!   ↑/↓       Navigate file list
-//!   Enter      Open directory / select file
-//!   Backspace  Go up one directory
-//!   d          Download selected file to local disk
-//!   u          Upload a local file or directory to current directory
-//!   n          Create new directory
-//!   D          Delete selected file/directory
-//!   r          Rename selected file/directory
-//!   i          Show volume info
-//!   c          Clean up macOS metadata from current directory
-//!   Esc        Cancel running operation / Quit
-//!   q          Quit
+//!   ↑ / k             Move selection up
+//!   ↓ / j             Move selection down
+//!   Home              Jump to first entry
+//!   End               Jump to last entry
+//!   PageUp            Move selection up by one page
+//!   PageDown          Move selection down by one page
+//!   Enter / →         Open directory / show file info
+//!   Backspace / ←     Go up one directory
+//!   d                 Download selected file to local disk
+//!   u                 Upload a local file or directory into current directory
+//!   m                 Create new directory (mkdir)
+//!   D                 Delete selected file/directory
+//!   r                 Rename selected file/directory
+//!   i                 Show volume info
+//!   c                 Clean up macOS metadata from current directory
+//!   Esc               Cancel a running I/O operation (when busy) / quit (when idle)
+//!   q                 Quit
 
 use std::fs;
 use std::io::{self, stdout};
@@ -47,7 +52,11 @@ use fatxlib::volume::FatxVolume;
 
 #[allow(dead_code)]
 struct DisplayEntry {
+    /// Raw on-disk filename. Used for navigation and download paths.
     name: String,
+    /// Slot-aware human-formatted name (e.g. `"Halo 3 [4D5307E6]"`).
+    /// Used purely for the listing UI; never for path operations.
+    display_name: String,
     is_dir: bool,
     size: u64,
     modified: String,
@@ -287,8 +296,15 @@ fn io_worker(
                                         "-"
                                     },
                                 );
+                                let raw = e.filename();
+                                let display_name = if e.is_directory() {
+                                    fatxlib::display::format_for_path(&path, &raw)
+                                } else {
+                                    raw.clone()
+                                };
                                 DisplayEntry {
-                                    name: e.filename(),
+                                    name: raw,
+                                    display_name,
                                     is_dir: e.is_directory(),
                                     size: e.file_size as u64,
                                     modified: e.write_datetime_str(),
@@ -769,7 +785,7 @@ fn handle_io_response(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, resp: IoResp)
             } else {
                 app.list_state.select(None);
                 app.set_status(
-                    "(empty directory) — Backspace to go up, u to upload, n to mkdir, q to quit",
+                    "(empty directory) — Backspace to go up, u to upload, m to mkdir, q to quit",
                 );
             }
         }
@@ -906,7 +922,7 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
                 app.list_state.select(Some(new));
             }
         }
-        KeyCode::Enter => {
+        KeyCode::Enter | KeyCode::Right => {
             if let Some(entry) = app.selected_entry() {
                 if entry.is_dir {
                     let new_cwd = app.full_path(&entry.name);
@@ -957,7 +973,7 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
             app.input_buffer = default;
             app.input_mode = InputMode::UploadPath;
         }
-        KeyCode::Char('n') => {
+        KeyCode::Char('m') => {
             app.input_prompt = "New directory name:".to_string();
             app.input_buffer.clear();
             app.input_mode = InputMode::MkdirName;
@@ -1165,7 +1181,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             };
             let line = format!(
                 " {} {:<42} {:>10}  {}  {}",
-                icon, e.name, size_str, e.modified, e.attributes,
+                icon, e.display_name, size_str, e.modified, e.attributes,
             );
             let style = if e.is_dir {
                 Style::default().fg(Color::Cyan).bold()
@@ -1221,7 +1237,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         let help = if app.is_busy {
             " Esc: cancel "
         } else {
-            " d:download  u:upload  n:mkdir  D:delete  r:rename  i:info  c:cleanup  q:quit "
+            " d:download  u:upload  m:mkdir  D:delete  r:rename  i:info  c:cleanup  q:quit "
         };
         let status_bar = Paragraph::new(format!(" {}", app.status))
             .style(style)
