@@ -19,6 +19,7 @@ pub struct TitleExecutionInfo {
     pub disc_count: u8,
 }
 
+#[derive(Clone, Debug)]
 pub struct TitleInfo {
     pub content_type: ContentType,
     pub execution_info: TitleExecutionInfo,

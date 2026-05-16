@@ -721,7 +721,12 @@ fn io_worker(
                         continue;
                     }
                 };
-                let plan = match fatxlib::iso::extract::plan_extract(&mut img, false) {
+                let plan = match fatxlib::iso::manifest::build_manifest(
+                    &mut img,
+                    fatxlib::iso::manifest::IsoFilterPolicy {
+                        keep_systemupdate: false,
+                    },
+                ) {
                     Ok(plan) => plan,
                     Err(e) => {
                         let _ = resp_tx.send(IoResp::Error {
@@ -751,7 +756,7 @@ fn io_worker(
                 let mut cancelled = false;
                 let mut failed = false;
 
-                for entry in &plan.kept {
+                for entry in plan.kept() {
                     if cancel_flag.load(Ordering::Relaxed) {
                         cancelled = true;
                         break;

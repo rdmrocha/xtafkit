@@ -4,7 +4,7 @@
 //! FATX/XTAF transport concerns.
 
 pub mod compact;
-pub mod extract;
 pub mod god;
 pub mod image;
+pub mod manifest;
 pub mod policy;

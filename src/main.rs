@@ -1177,7 +1177,10 @@ fn run_extract(
             return;
         }
     };
-    let plan = match fatxlib::iso::extract::plan_extract(&mut img, keep_systemupdate) {
+    let plan = match fatxlib::iso::manifest::build_manifest(
+        &mut img,
+        fatxlib::iso::manifest::IsoFilterPolicy { keep_systemupdate },
+    ) {
         Ok(plan) => plan,
         Err(e) => {
             cli_error(json, &format!("walk {}: {}", iso.display(), e));
@@ -1202,10 +1205,10 @@ fn run_extract(
                     "skipped_bytes": skipped_bytes,
                     "entries": plan.entries.iter().map(|e| {
                         serde_json::json!({
-                            "path": e.path,
-                            "offset": e.offset,
-                            "size": e.size,
-                            "skipped": plan.is_skipped(e, keep_systemupdate),
+                            "path": e.file.path,
+                            "offset": e.file.offset,
+                            "size": e.file.size,
+                            "skipped": e.skipped,
                         })
                     }).collect::<Vec<_>>(),
                 })
@@ -1223,14 +1226,13 @@ fn run_extract(
             }
             println!();
             for e in &plan.entries {
-                let s = plan.is_skipped(e, keep_systemupdate);
-                let tag = if s { "skip " } else { "keep " };
+                let tag = if e.skipped { "skip " } else { "keep " };
                 println!(
                     "  {} {:48}  @0x{:010X}  {}",
                     tag,
-                    e.path,
-                    e.offset,
-                    format_size(e.size)
+                    e.file.path,
+                    e.file.offset,
+                    format_size(e.file.size)
                 );
             }
             println!();
@@ -1249,7 +1251,7 @@ fn run_extract(
     let mut bytes_done: u64 = 0;
     let last_progress = std::cell::Cell::new(Instant::now());
 
-    for e in &plan.kept {
+    for e in plan.kept() {
         let normalized = e.path.replace('\\', "/");
         let local = dest.join(&normalized);
         if let Some(parent) = local.parent()

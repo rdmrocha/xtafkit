@@ -4,16 +4,17 @@
 //! temporary `.iso` on disk. Metadata regions are synthesized in memory; file
 //! regions are read lazily from the source image when the reader is consumed.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{FatxError, Result};
-use crate::executable::{TitleExecutionInfo, TitleInfo};
+use crate::executable::TitleExecutionInfo;
 
 use super::god::ContentType;
-use super::policy::is_systemupdate_path;
+use super::image::XisoImage;
+use super::manifest::{IsoFilterPolicy, build_manifest};
 
 use xdvdfs::layout::{DirectoryEntryTable, SECTOR_SIZE, VolumeDescriptor};
 use xdvdfs::write::dirtab::DirectoryEntryTableWriter;
@@ -169,43 +170,11 @@ fn xdvdfs_other<E: std::fmt::Debug>(ctx: &str, err: E) -> FatxError {
     FatxError::Other(format!("{ctx}: {err:?}"))
 }
 
-fn collect_source_file_offsets(
-    volume: VolumeDescriptor,
-    xiso: &mut SourceOffsetDevice,
-) -> Result<HashMap<String, u64>> {
-    let mut out = HashMap::new();
-    let entries = volume
-        .root_table
-        .file_tree(xiso)
-        .map_err(|e| xdvdfs_other("xdvdfs file_tree", e))?;
-    for (parent, entry) in entries {
-        if entry.node.dirent.is_directory() || entry.node.dirent.data.is_empty() {
-            continue;
-        }
-        let name = entry
-            .name_str::<std::io::Error>()
-            .map_err(|e| xdvdfs_other("xdvdfs bad filename", e))?;
-        let path = if parent.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}/{}", parent.trim_start_matches('/'), name)
-        };
-        out.insert(
-            path,
-            entry
-                .node
-                .dirent
-                .data
-                .offset::<std::io::Error>(0)
-                .map_err(|e| xdvdfs_other("xdvdfs bad offset", e))?,
-        );
-    }
-    Ok(out)
-}
-
 fn collect_compact_tree(
     fs: &mut SourceFilesystem,
     should_abort: Option<&dyn Fn() -> bool>,
+    kept_paths: &HashSet<String>,
+    kept_dirs: &HashSet<String>,
 ) -> Result<Vec<CompactTreeEntry>> {
     let mut dirs = vec![PathVec::default()];
     let mut out = Vec::new();
@@ -222,7 +191,11 @@ fn collect_compact_tree(
                 .map_err(|e| FatxError::Other(format!("xdvdfs compact read_dir: {e}")))?;
         listing.retain(|entry| {
             let path = PathVec::from_base(&dir, &entry.name).as_string();
-            !is_systemupdate_path(&path)
+            let path = normalize_path(&path);
+            match entry.file_type {
+                FileType::Directory => kept_dirs.contains(path),
+                FileType::File => kept_paths.contains(path),
+            }
         });
 
         for entry in &listing {
@@ -291,23 +264,33 @@ pub(crate) fn build_compact_source(
         return Err(cancelled("compact_source"));
     }
 
-    let file = File::open(source_iso).map_err(FatxError::Io)?;
-    let mut xiso = xdvdfs::blockdev::OffsetWrapper::new(file)
-        .map_err(|e| xdvdfs_other("xdvdfs offset detect", e))?;
-    let volume =
-        xdvdfs::read::read_volume(&mut xiso).map_err(|e| xdvdfs_other("xdvdfs read_volume", e))?;
-    let title_info = TitleInfo::from_image(&mut xiso, volume)?;
-    let exe_info = title_info.execution_info.clone();
-    let content_type = title_info.content_type;
-    let partition_offset = {
-        xiso.seek(SeekFrom::Start(0)).map_err(FatxError::Io)?;
-        xiso.get_mut().stream_position().map_err(FatxError::Io)?
+    let manifest = {
+        let file = File::open(source_iso).map_err(FatxError::Io)?;
+        let mut img = XisoImage::open(file)?;
+        build_manifest(
+            &mut img,
+            IsoFilterPolicy {
+                keep_systemupdate: false,
+            },
+        )?
     };
+    let title_info = manifest
+        .title_info
+        .clone()
+        .ok_or_else(|| FatxError::Other("xdvdfs compact: no executable found".into()))?;
+    let exe_info = title_info.execution_info;
+    let content_type = title_info.content_type;
+    let partition_offset = manifest.partition_offset;
+    let file_offsets: HashMap<String, u64> = manifest.kept_offset_map();
+    let kept_paths = manifest.kept_path_set();
+    let kept_dirs = manifest.kept_dir_set();
 
-    let file_offsets = collect_source_file_offsets(volume, &mut xiso)?;
+    let file = File::open(source_iso).map_err(FatxError::Io)?;
+    let xiso = xdvdfs::blockdev::OffsetWrapper::new(file)
+        .map_err(|e| xdvdfs_other("xdvdfs offset detect", e))?;
     let mut fs = XDVDFSFilesystem::new(xiso)
         .ok_or_else(|| FatxError::Other("xdvdfs compact: could not open source image".into()))?;
-    let tree = collect_compact_tree(&mut fs, should_abort)?;
+    let tree = collect_compact_tree(&mut fs, should_abort, &kept_paths, &kept_dirs)?;
     let dirent_tables = build_compact_dirent_tables(&tree)?;
 
     let mut dir_sectors = BTreeMap::new();
@@ -383,4 +366,8 @@ pub(crate) fn build_compact_source(
         partition_offset,
         plan: CompactImagePlan { data_size, regions },
     })
+}
+
+fn normalize_path(path: &str) -> &str {
+    path.trim_start_matches('/')
 }
