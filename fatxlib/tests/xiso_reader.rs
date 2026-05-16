@@ -161,6 +161,21 @@ fn extract_fixture_into_fatx_volume() {
 }
 
 #[test]
+fn fixture_title_info_returns_xellaunch() {
+    let Some(mut img) = open_fixture() else {
+        return;
+    };
+    let info = img
+        .title_info()
+        .expect("title_info should succeed on fixture")
+        .expect("fixture has a Default.xex, so title_info must be Some");
+    assert_eq!(
+        info.execution_info.title_id, 0xFFFF011D,
+        "fixture default.xex is XellLaunch2_retail (TitleID 0xFFFF011D)"
+    );
+}
+
+#[test]
 fn streams_invokes_progress_callback() {
     let Some(mut img) = open_fixture() else {
         return;

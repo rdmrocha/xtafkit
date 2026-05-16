@@ -1,5 +1,9 @@
 use crate::error::{FatxError, Result};
 use crate::iso2god::god::ContentType;
+// NB: ContentType lives in `iso2god::god` because it's part of the GoD
+// container format's CON header. We pull it in here only because TitleInfo
+// reports it alongside the execution info. If iso2god ever moves out to a
+// sibling crate, this `use` becomes the seam to revisit.
 use byteorder::{BE, LE, ReadBytesExt};
 use std::io::{Read, Seek, SeekFrom};
 use xdvdfs::{blockdev::BlockDeviceRead, layout::VolumeDescriptor};

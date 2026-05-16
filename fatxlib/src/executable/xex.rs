@@ -6,7 +6,7 @@ use bitflags::bitflags;
 use num_enum::TryFromPrimitive;
 
 use crate::error::{FatxError, Result};
-use crate::iso2god::executable::TitleExecutionInfo;
+use crate::executable::TitleExecutionInfo;
 
 #[derive(Clone, Debug)]
 pub struct XexHeader {

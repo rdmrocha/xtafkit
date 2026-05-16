@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::iso2god::executable::TitleExecutionInfo;
+use crate::executable::TitleExecutionInfo;
 
 use super::*;
 

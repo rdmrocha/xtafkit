@@ -141,6 +141,28 @@ impl<R: Read + Seek + Send + Sync> XisoImage<R> {
         LAYOUTS.iter().find(|l| l.offset == self.partition_offset)
     }
 
+    /// Parse the embedded `Default.xex` (Xbox 360) or `default.xbe`
+    /// (Original Xbox) and return the title's execution info — TitleID,
+    /// MediaID, version, content type, etc. Returns `None` if the image
+    /// has neither executable.
+    ///
+    /// Useful for resolving a human-readable game title via
+    /// [`crate::titles::lookup`] before extracting, so on-drive folder
+    /// names track the game rather than the local filename.
+    pub fn title_info(&mut self) -> Result<Option<crate::executable::TitleInfo>> {
+        let mut shifted = ShiftedSource {
+            inner: &mut self.source,
+            offset: self.partition_offset,
+        };
+        match crate::executable::TitleInfo::from_image(&mut shifted, self.volume) {
+            Ok(info) => Ok(Some(info)),
+            Err(crate::error::FatxError::Other(msg)) if msg.contains("no executable found") => {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Walk the entire directory tree, returning every file (not directories)
     /// as a flat list with image-relative paths and data-partition-relative
     /// byte offsets.
@@ -251,6 +273,20 @@ struct ShiftedSource<'a, R: Read + Seek + Send + Sync> {
 impl<R: Read + Seek + Send + Sync> BlockDeviceRead<std::io::Error> for ShiftedSource<'_, R> {
     fn read(&mut self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
         BlockDeviceRead::<std::io::Error>::read(self.inner, offset + self.offset, buffer)
+    }
+}
+
+// `xdvdfs::executable::TitleInfo::from_image` requires `R: BlockDeviceRead + Seek`.
+// We pass the inner Seek through, shifting `Start` positions into the data
+// partition; `Current` / `End` are forwarded unchanged.
+impl<R: Read + Seek + Send + Sync> Seek for ShiftedSource<'_, R> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let adjusted = match pos {
+            std::io::SeekFrom::Start(s) => std::io::SeekFrom::Start(s + self.offset),
+            other => other,
+        };
+        let abs = self.inner.seek(adjusted)?;
+        Ok(abs.saturating_sub(self.offset))
     }
 }
 

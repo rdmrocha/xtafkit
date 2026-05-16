@@ -28,6 +28,7 @@
 pub mod content_types;
 pub mod display;
 pub mod error;
+pub mod executable;
 pub mod iso2god;
 pub mod partition;
 pub mod platform;

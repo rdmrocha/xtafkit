@@ -1,5 +1,5 @@
 use crate::error::{FatxError, Result};
-use crate::iso2god::executable::TitleExecutionInfo;
+use crate::executable::TitleExecutionInfo;
 use byteorder::{LE, ReadBytesExt};
 use std::io::{Read, Seek, SeekFrom};
 

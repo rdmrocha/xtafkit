@@ -316,6 +316,56 @@ fn is_xiso(path: &std::path::Path) -> bool {
     }
 }
 
+/// Resolve the destination folder name for an XISO extract by reading the
+/// embedded `Default.xex` / `default.xbe` and looking the TitleID up in
+/// [`fatxlib::titles`]. Returns the catalog-known game name, sanitized for
+/// FATX's filename rules. Returns `None` if the image has no parsable
+/// executable, the TitleID isn't in the catalog, or the resulting name is
+/// empty after sanitization — callers should fall back to the file stem.
+fn xiso_folder_name(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut img = XisoImage::open(file).ok()?;
+    let info = img.title_info().ok().flatten()?;
+    let resolved = fatxlib::titles::lookup(info.execution_info.title_id)?;
+    let sanitized = sanitize_fatx_filename(resolved.name);
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+/// Coerce a free-form string into something FATX will accept as a filename.
+/// Replaces characters the filesystem rejects with `-`, collapses runs of
+/// whitespace, trims edge punctuation, and truncates to FATX's 42-byte
+/// filename limit.
+fn sanitize_fatx_filename(raw: &str) -> String {
+    const MAX_LEN: usize = 42;
+    // FATX rejects: < > : " / \ | ? *  (plus controls). Replace with '-'.
+    let mut cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            c if c.is_control() => '-',
+            c => c,
+        })
+        .collect();
+    while cleaned.contains("  ") {
+        cleaned = cleaned.replace("  ", " ");
+    }
+    let trimmed = cleaned.trim_matches(['.', ' ']);
+    if trimmed.len() <= MAX_LEN {
+        trimmed.to_string()
+    } else {
+        trimmed
+            .chars()
+            .take(MAX_LEN)
+            .collect::<String>()
+            .trim_end_matches(['.', ' ', '-'])
+            .to_string()
+    }
+}
+
 /// Image-relative paths we always strip when extracting an XISO. Currently
 /// just `$SystemUpdate/*` — dashboard update payload that alt dashboards
 /// never launch and that wastes tens to hundreds of MiB on the destination
@@ -844,30 +894,22 @@ fn io_worker(
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| source.display().to_string());
 
-                // Stage the conversion in a local temp dir, then upload the
-                // resulting Title-ID tree into FATX. A future refactor can
-                // plumb `convert_iso` to write straight to FATX via a sink
-                // trait; the staging approach is simple, correct, and reuses
-                // the already-tested `copy_from_host_with_control` path.
-                let staging =
-                    std::env::temp_dir().join(format!("xtafkit-iso2god-{}", std::process::id()));
-                if let Err(e) = fs::create_dir_all(&staging) {
-                    let _ = resp_tx.send(IoResp::Error {
-                        message: format!("Create staging dir: {}", e),
-                    });
-                    continue;
-                }
+                let upload_dest = dest_dir.trim_end_matches('/').to_string();
 
-                // Dry-run pass first so we can resolve the human-readable
-                // title before the real convert opens the file.
+                // Dry-run first so we can resolve the human-readable title
+                // and announce the destination before the streaming pass.
                 let mut dry_opts = fatxlib::iso2god::ConvertOptions {
                     dry_run: true,
                     ..Default::default()
                 };
-                let report = match fatxlib::iso2god::convert_iso(&source, &staging, &mut dry_opts) {
+                let report = match fatxlib::iso2god::convert_iso_to_fatx(
+                    &source,
+                    &mut vol,
+                    &dest_dir,
+                    &mut dry_opts,
+                ) {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = fs::remove_dir_all(&staging);
                         let _ = resp_tx.send(IoResp::Error {
                             message: format!("Parse {}: {}", source.display(), e),
                         });
@@ -881,32 +923,75 @@ fn io_worker(
                         "Converting {} ({}) → {}/{:08X}/00007000/{:08X}...",
                         display_source,
                         resolved_name.unwrap_or("unknown title"),
-                        dest_dir.trim_end_matches('/'),
+                        upload_dest,
                         report.title_id,
                         report.media_id,
                     ),
                 });
 
-                // Wire the convert_iso progress + cancel hooks. The two
-                // closures share the same lifetime so they can both go into
-                // ConvertOptions without lifetime gymnastics.
+                // Wire progress + cancel hooks. Both closures share the
+                // same lifetime so they can co-exist in ConvertOptions.
                 let cancel_flag_inner = cancel_flag.clone();
                 let abort_fn = move || cancel_flag_inner.load(Ordering::Relaxed);
                 let resp_tx_inner = resp_tx.clone();
                 let mut last_stage = String::new();
+                let mut last_emit_at: Option<std::time::Instant> = None;
+                let mut last_emit_bytes: u64 = 0;
                 let mut progress_cb = move |stage: &str, current: u64, total: u64| {
-                    let denom = total.max(1);
-                    let stride = (denom / 20).max(1);
-                    if stage != last_stage
-                        || current == 0
-                        || current == total
-                        || current.is_multiple_of(stride)
-                    {
+                    let stage_changed = stage != last_stage;
+                    let now = std::time::Instant::now();
+
+                    // Byte-level stages ("part X/Y"): rate-limit to ~200 ms
+                    // intervals, and compute MiB/s from the delta between
+                    // emits. Stage transitions always emit so the user sees
+                    // each part's first tick immediately.
+                    if stage.starts_with("part ") {
+                        if !stage_changed
+                            && let Some(t) = last_emit_at
+                            && now.duration_since(t).as_millis() < 200
+                        {
+                            return;
+                        }
+                        let throughput = if !stage_changed {
+                            last_emit_at
+                                .map(|t| {
+                                    let dt = now.duration_since(t).as_secs_f64();
+                                    let dbytes = current.saturating_sub(last_emit_bytes);
+                                    let rate = (dbytes as f64) / dt / (1024.0 * 1024.0);
+                                    format!(" @ {:.1} MiB/s", rate)
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let msg = format!(
+                            "[{}] {} / {}{}",
+                            stage,
+                            format_size(current),
+                            format_size(total),
+                            throughput
+                        );
+                        let _ = resp_tx_inner.send(IoResp::Progress { message: msg });
+                    } else {
+                        // Integer-milestone stages (parts / mht / header):
+                        // keep the 5 % throttle, render the raw count.
+                        let denom = total.max(1);
+                        let stride = (denom / 20).max(1);
+                        if !stage_changed
+                            && current != 0
+                            && current != total
+                            && !current.is_multiple_of(stride)
+                        {
+                            return;
+                        }
                         let _ = resp_tx_inner.send(IoResp::Progress {
                             message: format!("[{}] {}/{}", stage, current, total),
                         });
-                        last_stage = stage.to_string();
                     }
+
+                    last_stage = stage.to_string();
+                    last_emit_at = Some(now);
+                    last_emit_bytes = current;
                 };
 
                 let mut opts = fatxlib::iso2god::ConvertOptions {
@@ -917,12 +1002,27 @@ fn io_worker(
                     should_abort: Some(&abort_fn),
                 };
 
-                let convert_result = fatxlib::iso2god::convert_iso(&source, &staging, &mut opts);
-
-                match convert_result {
-                    Ok(_) => {}
+                match fatxlib::iso2god::convert_iso_to_fatx(&source, &mut vol, &dest_dir, &mut opts)
+                {
+                    Ok(r) => {
+                        let _ = vol.flush();
+                        // Rough total: per-part overhead (4 KiB master +
+                        // 4 KiB × subparts) plus the CON header. Reporting
+                        // the source-side data size is close enough.
+                        let _ = resp_tx.send(IoResp::Done {
+                            message: format!(
+                                "Converted {} → {}/{:08X}/00007000/{:08X} ({} parts, ~{})",
+                                display_source,
+                                upload_dest,
+                                r.title_id,
+                                r.media_id,
+                                r.part_count,
+                                format_size(r.data_size),
+                            ),
+                        });
+                    }
                     Err(e) => {
-                        let _ = fs::remove_dir_all(&staging);
+                        let _ = vol.flush();
                         let msg = format!("{}", e);
                         if msg.contains("cancelled") {
                             let _ = resp_tx.send(IoResp::Cancelled {
@@ -930,73 +1030,7 @@ fn io_worker(
                             });
                         } else {
                             let _ = resp_tx.send(IoResp::Error {
-                                message: format!("convert_iso: {}", msg),
-                            });
-                        }
-                        continue;
-                    }
-                }
-
-                let _ = resp_tx.send(IoResp::Progress {
-                    message: "Uploading GoD package to FATX...".to_string(),
-                });
-
-                // Upload the staged tree into FATX. The temp dir's name is a
-                // generated UUID we don't want as a folder on the drive, so
-                // pass `dest_dir` without a trailing slash — that drops the
-                // temp dir's CHILDREN (the Title-ID folder we want) directly
-                // under cwd.
-                let upload_cancel = cancel_flag.clone();
-                let upload_abort = move || upload_cancel.load(Ordering::Relaxed);
-                let resp_tx_upload = resp_tx.clone();
-                let upload_progress = move |path: &str, bytes_done: u64, total: u64| {
-                    let msg = if total > 0 {
-                        format!(
-                            "Uploading: {} ({}/{})",
-                            path,
-                            format_size(bytes_done),
-                            format_size(total)
-                        )
-                    } else {
-                        format!("Uploading: {}", path)
-                    };
-                    let _ = resp_tx_upload.send(IoResp::Progress { message: msg });
-                };
-
-                let upload_dest = dest_dir.trim_end_matches('/').to_string();
-                let upload_result = vol.copy_from_host_with_control(
-                    &staging,
-                    &upload_dest,
-                    Some(&upload_progress),
-                    Some(&upload_abort),
-                    100,
-                    256 * 1024 * 1024,
-                );
-                let _ = fs::remove_dir_all(&staging);
-                let _ = vol.flush();
-
-                match upload_result {
-                    Ok((files, _dirs, bytes)) => {
-                        let _ = resp_tx.send(IoResp::Done {
-                            message: format!(
-                                "Converted {} → {}/{:08X}/00007000/{:08X} ({} files, {})",
-                                display_source,
-                                upload_dest,
-                                report.title_id,
-                                report.media_id,
-                                files,
-                                format_size(bytes),
-                            ),
-                        });
-                    }
-                    Err(e) => {
-                        if cancel_flag.load(Ordering::Relaxed) {
-                            let _ = resp_tx.send(IoResp::Cancelled {
-                                message: format!("GoD upload cancelled ({})", display_source),
-                            });
-                        } else {
-                            let _ = resp_tx.send(IoResp::Error {
-                                message: format!("GoD upload: {}", e),
+                                message: format!("GoD convert: {}", msg),
                             });
                         }
                     }
@@ -1534,9 +1568,8 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
             }
         }
         KeyCode::Char('u') => {
-            let default = app.download_dir.to_string_lossy().to_string();
             app.input_prompt = format!("Upload file/directory to '{}':", app.cwd);
-            app.input_buffer = default;
+            app.input_buffer.clear();
             app.input_mode = InputMode::UploadPath;
         }
         KeyCode::Char('m') => {
@@ -1750,13 +1783,18 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
 
                 match action {
                     XisoUploadAction::Extract => {
-                        // Subfolder name = file stem; fall back to filename
-                        // if there's no extension to strip.
+                        // Prefer a catalog-resolved folder name over the
+                        // local filename stem: a disc named `disc1.iso`
+                        // with TitleID 0x4D5307E6 should land at
+                        // `<cwd>/Halo 3 [4D5307E6]/` rather than `<cwd>/disc1/`.
+                        // Falls back to the file stem on catalog miss or
+                        // unreadable XEX/XBE.
                         let stem = path
                             .file_stem()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| filename.clone());
-                        let dest_dir = app.full_path(&stem);
+                        let resolved = xiso_folder_name(&path).unwrap_or(stem);
+                        let dest_dir = app.full_path(&resolved);
                         app.set_status(&format!("Extracting '{}' → {}...", filename, dest_dir));
                         let _ = cmd_tx.send(IoCmd::ExtractXiso {
                             source: path,
@@ -1946,12 +1984,17 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if app.input_mode != InputMode::Normal {
         let input_text = format!(" {} {}", app.input_prompt, app.input_buffer);
         let input_bar = Paragraph::new(input_text)
-            .style(Style::default().fg(Color::LightYellow).bg(Color::Blue))
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::DarkGray)
+                    .bold(),
+            )
             .block(
                 Block::default()
                     .title(" Input (Enter to confirm, Esc to cancel) ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::LightYellow)),
+                    .border_style(Style::default().fg(Color::Yellow).bold()),
             );
         frame.render_widget(input_bar, chunks[2]);
 
@@ -2033,6 +2076,48 @@ mod tests {
     fn test_is_xiso_junk_case_insensitive() {
         assert!(is_xiso_junk("$SYSTEMUPDATE/foo"));
         assert!(is_xiso_junk("$systemupdate/foo"));
+    }
+
+    #[test]
+    fn test_sanitize_fatx_filename_replaces_illegal_chars() {
+        assert_eq!(
+            sanitize_fatx_filename("Halo: Combat Evolved"),
+            "Halo- Combat Evolved"
+        );
+        assert_eq!(
+            sanitize_fatx_filename(r"Tom Clancy's R6: Vegas <DEMO>"),
+            "Tom Clancy's R6- Vegas -DEMO-"
+        );
+        assert_eq!(
+            sanitize_fatx_filename("path/with\\slashes"),
+            "path-with-slashes"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_fatx_filename_truncates_to_42_bytes() {
+        let long = "A Really Long Game Subtitle That Definitely Will Not Fit";
+        let s = sanitize_fatx_filename(long);
+        assert!(s.len() <= 42, "got {:?} ({} bytes)", s, s.len());
+        // Truncation should be at a word boundary or just under 42 bytes;
+        // never end with a dangling separator.
+        assert!(!s.ends_with(' '));
+        assert!(!s.ends_with('-'));
+        assert!(!s.ends_with('.'));
+    }
+
+    #[test]
+    fn test_sanitize_fatx_filename_collapses_runs_of_whitespace() {
+        assert_eq!(
+            sanitize_fatx_filename("Halo  3   Anniversary"),
+            "Halo 3 Anniversary"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_fatx_filename_trims_edges() {
+        assert_eq!(sanitize_fatx_filename("  Halo 3   "), "Halo 3");
+        assert_eq!(sanitize_fatx_filename("...Halo 3..."), "Halo 3");
     }
 
     #[test]
