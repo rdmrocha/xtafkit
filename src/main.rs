@@ -699,7 +699,11 @@ fn interactive_ls(vol: &mut FatxVolume<std::fs::File>, cwd: &str) {
     println!("  {}", "-".repeat(60));
 
     for entry in &entries {
-        let name = entry.filename();
+        let name = if entry.is_directory() {
+            fatxlib::display::format_for_path(cwd, &entry.filename())
+        } else {
+            entry.filename()
+        };
         let attr = format!(
             "{}{}{}{}",
             if entry.is_directory() { "d" } else { "-" },
@@ -759,7 +763,9 @@ fn interactive_cd(vol: &mut FatxVolume<std::fs::File>, cwd: &str) -> String {
                 println!("    ..) Go up (parent directory)");
             }
             for (i, d) in dirs.iter().enumerate() {
-                println!("    {}) {}/", i + 1, d.filename());
+                let display =
+                    fatxlib::display::format_for_path(&current, &d.filename());
+                println!("    {}) {}/", i + 1, display);
             }
         }
 
@@ -1041,7 +1047,12 @@ fn interactive_rm(vol: &mut FatxVolume<std::fs::File>, cwd: &str) {
     println!("  Items:");
     for (i, e) in entries.iter().enumerate() {
         let kind = if e.is_directory() { "<DIR>" } else { "" };
-        println!("    {}) {} {}", i + 1, e.filename(), kind);
+        let display = if e.is_directory() {
+            fatxlib::display::format_for_path(cwd, &e.filename())
+        } else {
+            e.filename()
+        };
+        println!("    {}) {} {}", i + 1, display, kind);
     }
 
     print!(
@@ -1122,7 +1133,12 @@ fn interactive_rename(vol: &mut FatxVolume<std::fs::File>, cwd: &str) {
 
     println!("  Items:");
     for (i, e) in entries.iter().enumerate() {
-        println!("    {}) {}", i + 1, e.filename());
+        let display = if e.is_directory() {
+            fatxlib::display::format_for_path(cwd, &e.filename())
+        } else {
+            e.filename()
+        };
+        println!("    {}) {}", i + 1, display);
     }
 
     print!("\n  Select item [1-{}] or enter name: ", entries.len());
@@ -1489,8 +1505,12 @@ fn dirent_to_json(entry: &fatxlib::types::DirectoryEntry) -> JsonDirEntry {
     }
 }
 
-fn print_entry(entry: &fatxlib::types::DirectoryEntry, long: bool) {
-    let name = entry.filename();
+fn print_entry(entry: &fatxlib::types::DirectoryEntry, parent_path: &str, long: bool) {
+    let name = if entry.is_directory() {
+        fatxlib::display::format_for_path(parent_path, &entry.filename())
+    } else {
+        entry.filename()
+    };
     if long {
         let attr = format!(
             "{}{}{}{}",
@@ -1719,7 +1739,7 @@ fn main() {
                         serde_json::to_string_pretty(&[dirent_to_json(&entry)]).unwrap()
                     );
                 } else {
-                    print_entry(&entry, long);
+                    print_entry(&entry, &path, long);
                 }
                 return;
             }
@@ -1744,7 +1764,7 @@ fn main() {
                     println!("{}", "-".repeat(65));
                 }
                 for e in &entries {
-                    print_entry(e, long);
+                    print_entry(e, &path, long);
                 }
             }
         }

@@ -47,7 +47,11 @@ use fatxlib::volume::FatxVolume;
 
 #[allow(dead_code)]
 struct DisplayEntry {
+    /// Raw on-disk filename. Used for navigation and download paths.
     name: String,
+    /// Slot-aware human-formatted name (e.g. `"Halo 3 [4D5307E6]"`).
+    /// Used purely for the listing UI; never for path operations.
+    display_name: String,
     is_dir: bool,
     size: u64,
     modified: String,
@@ -287,8 +291,15 @@ fn io_worker(
                                         "-"
                                     },
                                 );
+                                let raw = e.filename();
+                                let display_name = if e.is_directory() {
+                                    fatxlib::display::format_for_path(&path, &raw)
+                                } else {
+                                    raw.clone()
+                                };
                                 DisplayEntry {
-                                    name: e.filename(),
+                                    name: raw,
+                                    display_name,
                                     is_dir: e.is_directory(),
                                     size: e.file_size as u64,
                                     modified: e.write_datetime_str(),
@@ -1165,7 +1176,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             };
             let line = format!(
                 " {} {:<42} {:>10}  {}  {}",
-                icon, e.name, size_str, e.modified, e.attributes,
+                icon, e.display_name, size_str, e.modified, e.attributes,
             );
             let style = if e.is_dir {
                 Style::default().fg(Color::Cyan).bold()

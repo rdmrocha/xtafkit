@@ -25,12 +25,15 @@
 //! }
 //! ```
 
+pub mod content_types;
+pub mod display;
 pub mod error;
 pub mod partition;
 pub mod platform;
 pub mod titles;
 pub mod types;
 pub mod volume;
+pub mod xuids;
 
 pub use error::{FatxError, Result};
 pub use partition::{detect_xbox_partitions, format_size, DetectedPartition};

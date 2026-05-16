@@ -35,3 +35,15 @@ include!(concat!(env!("OUT_DIR"), "/titles.rs"));
 pub fn lookup(title_id: u32) -> Option<TitleInfo> {
     TITLES.get(&title_id).copied()
 }
+
+/// Render a raw on-disk title folder name (e.g. `"4D5307E6"`) as
+/// `"<name> [<raw>]"` if known, otherwise just `<raw>` unchanged. Raw case
+/// is preserved verbatim — lowercase on disk surfaces as lowercase in the
+/// display, since Xbox 360 writes upper-hex and lower-hex would signal a
+/// non-standard source worth noticing.
+pub fn format_folder(raw: &str) -> String {
+    let resolved = u32::from_str_radix(raw, 16)
+        .ok()
+        .and_then(|id| lookup(id).map(|info| info.name));
+    crate::display::format_with_raw(raw, resolved)
+}
