@@ -188,6 +188,56 @@ impl<R: Read + Seek + Send + Sync> XisoImage<R> {
         }
         Ok(written)
     }
+
+    /// Read `buf.len()` bytes from a data-partition-relative `offset`.
+    /// Used by [`XisoFileReader`] so its [`Read`] impl can pull bytes one
+    /// chunk at a time without holding an internal `&mut R`.
+    pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let mut shifted = ShiftedSource {
+            inner: &mut self.source,
+            offset: self.partition_offset,
+        };
+        BlockDeviceRead::<std::io::Error>::read(&mut shifted, offset, buf).map_err(FatxError::Io)
+    }
+
+    /// Borrow this image as a [`Read`] adapter scoped to a single file.
+    /// Returned reader is a cursor into `file`'s byte range; reading past EOF
+    /// returns `Ok(0)`. Useful for piping into APIs that consume a `Read`
+    /// (e.g. [`crate::volume::FatxVolume::create_file_from_reader`]).
+    pub fn file_reader<'a>(&'a mut self, file: &XisoFile) -> XisoFileReader<'a, R> {
+        XisoFileReader {
+            image: self,
+            file_offset: file.offset,
+            bytes_remaining: file.size,
+        }
+    }
+}
+
+/// `Read`-compatible cursor over a single [`XisoFile`].
+///
+/// Each call to [`Read::read`] pulls a chunk straight from the underlying
+/// image source through [`XisoImage::read_at`]; nothing is buffered above
+/// the kernel layer. EOF (`Ok(0)`) is reached after the file's declared
+/// `size` bytes have been served.
+pub struct XisoFileReader<'a, R: Read + Seek + Send + Sync> {
+    image: &'a mut XisoImage<R>,
+    file_offset: u64,
+    bytes_remaining: u64,
+}
+
+impl<R: Read + Seek + Send + Sync> Read for XisoFileReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.bytes_remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = (buf.len() as u64).min(self.bytes_remaining) as usize;
+        self.image
+            .read_at(self.file_offset, &mut buf[..want])
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.file_offset += want as u64;
+        self.bytes_remaining -= want as u64;
+        Ok(want)
+    }
 }
 
 /// Thin block-device adapter that adds a constant offset to every read.

@@ -14,7 +14,11 @@
 //!   Enter / →         Open directory / show file info
 //!   Backspace / ←     Go up one directory
 //!   d                 Download selected file to local disk
-//!   u                 Upload a local file or directory into current directory
+//!   u                 Upload a local file or directory into current directory.
+//!                     If the file parses as an XDVDFS/XISO disc image, the
+//!                     TUI asks whether to extract the contents into a new
+//!                     subfolder (preferred for alt dashboards) or copy the
+//!                     raw bytes as-is.
 //!   m                 Create new directory (mkdir)
 //!   D                 Delete selected file/directory
 //!   r                 Rename selected file/directory
@@ -56,6 +60,7 @@ use ratatui::{
 use fatxlib::partition::format_size;
 use fatxlib::types::FileAttributes;
 use fatxlib::volume::FatxVolume;
+use fatxlib::xiso::XisoImage;
 
 // ===========================================================================
 // Display types
@@ -132,6 +137,13 @@ enum IoCmd {
     CopyDir {
         local_path: PathBuf,
         fatx_dest: String,
+    },
+    /// Open `source` as an XDVDFS image and stream every file inside it into
+    /// `dest_dir` on the FATX volume, recreating the directory tree. The dest
+    /// directory itself is created by the worker; it must not already exist.
+    ExtractXiso {
+        source: PathBuf,
+        dest_dir: String,
     },
     Mkdir {
         path: String,
@@ -211,6 +223,9 @@ enum InputMode {
     RenameName,
     ConfirmDelete,
     ConfirmCleanup,
+    /// Confirmation prompt after detecting an XISO during upload — y extracts
+    /// the contents, n falls back to a raw byte copy.
+    ConfirmExtractXiso,
 }
 
 struct App {
@@ -232,6 +247,9 @@ struct App {
     cancel_flag: Arc<AtomicBool>,
     /// Pending cleanup paths awaiting user confirmation.
     pending_cleanup: Vec<(String, bool, u64)>,
+    /// Local XISO path stashed between the upload prompt and the
+    /// "extract or raw copy?" confirmation prompt.
+    pending_xiso_upload: Option<PathBuf>,
     /// Current listing sort order. Toggleable with `s`.
     sort_mode: SortMode,
 }
@@ -252,6 +270,30 @@ fn unescape_path(s: &str) -> String {
         }
     }
     result
+}
+
+/// Sniff whether `path` looks like an Xbox XDVDFS disc image by trying to
+/// parse a volume descriptor at one of the known XGD layout offsets.
+/// Cheap — only reads a handful of sectors near the volume descriptor.
+fn is_xiso(path: &std::path::Path) -> bool {
+    match std::fs::File::open(path) {
+        Ok(file) => XisoImage::open(file).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Image-relative paths we always strip when extracting an XISO. Currently
+/// just `$SystemUpdate/*` — dashboard update payload that alt dashboards
+/// never launch and that wastes tens to hundreds of MiB on the destination
+/// drive. `image_path` is expected to use forward slashes; the match is
+/// case-insensitive against the first segment.
+fn is_xiso_junk(image_path: &str) -> bool {
+    let first = image_path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+    first.eq_ignore_ascii_case("$SystemUpdate")
 }
 
 fn dirs_or_home() -> PathBuf {
@@ -278,6 +320,7 @@ impl App {
             is_busy: false,
             cancel_flag,
             pending_cleanup: Vec::new(),
+            pending_xiso_upload: None,
             sort_mode: SortMode::ByName,
         }
     }
@@ -582,6 +625,183 @@ fn io_worker(
                 }
             }
 
+            IoCmd::ExtractXiso { source, dest_dir } => {
+                cancel_flag.store(false, Ordering::Relaxed);
+
+                let display_source = source
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| source.display().to_string());
+
+                let file = match fs::File::open(&source) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = resp_tx.send(IoResp::Error {
+                            message: format!("Open {}: {}", source.display(), e),
+                        });
+                        continue;
+                    }
+                };
+                let mut img = match XisoImage::open(file) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        let _ = resp_tx.send(IoResp::Error {
+                            message: format!("Parse {}: {}", source.display(), e),
+                        });
+                        continue;
+                    }
+                };
+                let entries = match img.walk_files() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = resp_tx.send(IoResp::Error {
+                            message: format!("Walk {}: {}", source.display(), e),
+                        });
+                        continue;
+                    }
+                };
+
+                // Materialize the destination directory itself before any files.
+                if let Err(e) = vol.create_directory(&dest_dir) {
+                    let _ = resp_tx.send(IoResp::Error {
+                        message: format!("Create '{}': {}", dest_dir, e),
+                    });
+                    continue;
+                }
+
+                // Xbox 360 disc images carry a `$SystemUpdate` folder with
+                // the dashboard update payload. Alt dashboards never run it,
+                // and copying it just wastes hundreds of MiB of FATX space —
+                // so partition them out before counting totals so the per-file
+                // progress denominator reflects what we'll actually write.
+                let (kept, skipped): (
+                    Vec<&fatxlib::xiso::XisoFile>,
+                    Vec<&fatxlib::xiso::XisoFile>,
+                ) = entries
+                    .iter()
+                    .partition(|e| !is_xiso_junk(&e.path.replace('\\', "/")));
+                let total_files = kept.len();
+                let total_bytes: u64 = kept.iter().map(|f| f.size).sum();
+                let skipped_files = skipped.len();
+                let skipped_bytes: u64 = skipped.iter().map(|f| f.size).sum();
+
+                let mut files_done = 0usize;
+                let mut bytes_done: u64 = 0;
+                let mut files_since_flush = 0usize;
+                let mut bytes_since_flush = 0u64;
+                let mut cancelled = false;
+                let mut failed = false;
+
+                for entry in &kept {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        cancelled = true;
+                        break;
+                    }
+
+                    // Compose the FATX path; entry.path is image-relative
+                    // (no leading slash). Normalize to forward slashes — they
+                    // already are, but be defensive.
+                    let normalized = entry.path.replace('\\', "/");
+                    let fatx_path = format!("{}/{}", dest_dir.trim_end_matches('/'), normalized);
+
+                    // Ensure every parent directory exists.
+                    if let Some(parent_end) = fatx_path.rfind('/')
+                        && parent_end > 0
+                    {
+                        let parent = &fatx_path[..parent_end];
+                        if let Err(e) = ensure_dir_chain(&mut vol, parent) {
+                            let _ = resp_tx.send(IoResp::Error {
+                                message: format!("Create dir '{}': {}", parent, e),
+                            });
+                            failed = true;
+                            break;
+                        }
+                    }
+
+                    files_done += 1;
+                    let short_name = normalized
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&normalized)
+                        .to_string();
+                    let _ = resp_tx.send(IoResp::Progress {
+                        message: format!(
+                            "[{}/{}] {} ({}) — {}/{}",
+                            files_done,
+                            total_files,
+                            short_name,
+                            format_size(entry.size),
+                            format_size(bytes_done),
+                            format_size(total_bytes),
+                        ),
+                    });
+
+                    let reader = img.file_reader(entry);
+                    match vol.create_file_from_reader(&fatx_path, entry.size, reader, None) {
+                        Ok(()) => {
+                            bytes_done += entry.size;
+                            files_since_flush += 1;
+                            bytes_since_flush += entry.size;
+                        }
+                        Err(e) => {
+                            let _ = resp_tx.send(IoResp::Error {
+                                message: format!("{}: {}", fatx_path, e),
+                            });
+                            failed = true;
+                            break;
+                        }
+                    }
+
+                    // Flush periodically so a long extract survives a yank.
+                    if files_since_flush >= 100 || bytes_since_flush >= 256 * 1024 * 1024 {
+                        if let Err(e) = vol.flush() {
+                            let _ = resp_tx.send(IoResp::Error {
+                                message: format!("Periodic flush failed: {}", e),
+                            });
+                            failed = true;
+                            break;
+                        }
+                        files_since_flush = 0;
+                        bytes_since_flush = 0;
+                    }
+                }
+
+                let _ = vol.flush();
+
+                if cancelled {
+                    let _ = resp_tx.send(IoResp::Cancelled {
+                        message: format!(
+                            "Extract cancelled — {}/{} files written ({})",
+                            files_done.saturating_sub(1),
+                            total_files,
+                            format_size(bytes_done)
+                        ),
+                    });
+                } else if failed {
+                    // Error message already sent above; nothing else to do.
+                } else {
+                    let skipped_note = if skipped_files > 0 {
+                        format!(
+                            "; skipped $SystemUpdate ({} files, {})",
+                            skipped_files,
+                            format_size(skipped_bytes)
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let _ = resp_tx.send(IoResp::Done {
+                        message: format!(
+                            "Extracted {} → {} ({} files, {}{})",
+                            display_source,
+                            dest_dir,
+                            files_done,
+                            format_size(bytes_done),
+                            skipped_note,
+                        ),
+                    });
+                }
+            }
+
             IoCmd::Mkdir { path } => match vol.create_directory(&path) {
                 Ok(_) => {
                     let _ = vol.flush();
@@ -765,6 +985,40 @@ fn collect_files(local_dir: &PathBuf, fatx_dir: &str, out: &mut Vec<(PathBuf, St
             out.push((local_child, fatx_child));
         }
     }
+}
+
+/// Ensure every directory segment in an absolute FATX path exists, creating
+/// any that are missing. Used by [`IoCmd::ExtractXiso`] so an XISO with
+/// nested subfolders (e.g. `/Halo/Media/movie.bik`) can drop files anywhere
+/// without the caller pre-walking the tree. A pre-existing segment that
+/// happens to be a regular file is reported as an error.
+fn ensure_dir_chain(
+    vol: &mut FatxVolume<std::fs::File>,
+    fatx_dir: &str,
+) -> fatxlib::error::Result<()> {
+    use fatxlib::error::FatxError;
+
+    let trimmed = fatx_dir.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let parts: Vec<&str> = trimmed.split('/').filter(|p| !p.is_empty()).collect();
+    let mut acc = String::new();
+    for part in parts {
+        acc.push('/');
+        acc.push_str(part);
+        match vol.create_directory(&acc) {
+            Ok(()) => {}
+            Err(FatxError::FileExists(_)) => {
+                let existing = vol.resolve_path(&acc)?;
+                if !existing.is_directory() {
+                    return Err(FatxError::NotADirectory(acc.clone()));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Recursively create directory structure on the FATX volume.
@@ -1174,6 +1428,9 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
     match key.code {
         KeyCode::Esc => {
             app.input_mode = InputMode::Normal;
+            // If the user was answering the XISO extract/raw prompt, drop the
+            // stashed path so the next upload starts clean.
+            app.pending_xiso_upload = None;
             app.set_status("Cancelled.");
         }
         KeyCode::Enter => {
@@ -1197,8 +1454,10 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
                 });
                 app.is_busy = true;
             } else if app.input_prompt.starts_with("Upload ") {
-                // Upload file or directory — unescape shell backslashes (e.g. Call\ of\ Duty)
-                let path = PathBuf::from(unescape_path(&input));
+                // Upload file or directory — unescape shell backslashes
+                // (e.g. Call\ of\ Duty) and trim leading/trailing whitespace
+                // (drag-and-drop into the terminal often appends a space).
+                let path = PathBuf::from(unescape_path(input.trim()));
                 if !path.exists() {
                     app.set_error(&format!("Not found: {}", input));
                     return;
@@ -1215,6 +1474,18 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
                         local_path: path.clone(),
                         fatx_dest,
                     });
+                    app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
+                    app.is_busy = true;
+                } else if is_xiso(&path) {
+                    // Detected an Xbox disc image. Ask the user whether to
+                    // extract the contents (preferred — alt dashboards launch
+                    // loose game files directly) or fall back to raw copy.
+                    app.pending_xiso_upload = Some(path.clone());
+                    app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
+                    app.input_mode = InputMode::ConfirmExtractXiso;
+                    app.input_prompt =
+                        format!("Detected XISO '{}'. Extract contents? (Y/n):", filename);
+                    app.input_buffer.clear();
                 } else {
                     let fatx_path = app.full_path(&filename);
                     app.set_status(&format!("Uploading '{}'...", filename));
@@ -1222,9 +1493,49 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
                         local_path: path.clone(),
                         fatx_path,
                     });
+                    app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
+                    app.is_busy = true;
                 }
-                app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
-                app.is_busy = true;
+            } else if app.input_prompt.starts_with("Detected XISO") {
+                // Y / empty (default) → extract; N → fall back to raw byte copy.
+                let extract = input.is_empty()
+                    || input.eq_ignore_ascii_case("y")
+                    || input.eq_ignore_ascii_case("yes");
+                let path = match app.pending_xiso_upload.take() {
+                    Some(p) => p,
+                    None => {
+                        app.set_error("Internal: missing pending XISO path.");
+                        return;
+                    }
+                };
+                let filename = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "iso".to_string());
+
+                if extract {
+                    // Default subfolder name = file stem (no extension); fall
+                    // back to the whole filename if the path has no extension.
+                    let stem = path
+                        .file_stem()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| filename.clone());
+                    let dest_dir = app.full_path(&stem);
+                    app.set_status(&format!("Extracting '{}' → {}...", filename, dest_dir));
+                    let _ = cmd_tx.send(IoCmd::ExtractXiso {
+                        source: path,
+                        dest_dir,
+                    });
+                    app.is_busy = true;
+                } else {
+                    let fatx_path = app.full_path(&filename);
+                    app.set_status(&format!("Uploading '{}' (raw)...", filename));
+                    let _ = cmd_tx.send(IoCmd::WriteFile {
+                        local_path: path,
+                        fatx_path,
+                    });
+                    app.is_busy = true;
+                }
             } else if app.input_prompt.starts_with("New directory") {
                 // Mkdir
                 if !input.is_empty() {
@@ -1283,6 +1594,7 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
         KeyCode::Char(c) => {
             if app.input_mode == InputMode::ConfirmDelete
                 || app.input_mode == InputMode::ConfirmCleanup
+                || app.input_mode == InputMode::ConfirmExtractXiso
             {
                 app.input_buffer = c.to_string();
             } else {
@@ -1458,5 +1770,25 @@ mod tests {
     #[test]
     fn test_unescape_empty() {
         assert_eq!(unescape_path(""), "");
+    }
+
+    #[test]
+    fn test_is_xiso_junk_systemupdate() {
+        assert!(is_xiso_junk("$SystemUpdate"));
+        assert!(is_xiso_junk("$SystemUpdate/su20076000_00000000"));
+        assert!(is_xiso_junk("/$SystemUpdate/anything"));
+    }
+
+    #[test]
+    fn test_is_xiso_junk_case_insensitive() {
+        assert!(is_xiso_junk("$SYSTEMUPDATE/foo"));
+        assert!(is_xiso_junk("$systemupdate/foo"));
+    }
+
+    #[test]
+    fn test_is_xiso_junk_does_not_match_substring() {
+        assert!(!is_xiso_junk("default.xbe"));
+        assert!(!is_xiso_junk("Media/$SystemUpdate")); // not the first segment
+        assert!(!is_xiso_junk("MyGame$SystemUpdate/foo"));
     }
 }

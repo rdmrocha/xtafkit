@@ -44,9 +44,23 @@ sudo ./target/release/xtafkit ls /dev/rdiskN --partition "360 Data" /
 
 ## Code Style
 
-- Run `cargo fmt` before committing
-- Run `cargo clippy` and address warnings
-- Follow existing patterns in the codebase
+Every commit must pass formatting and clippy with no warnings:
+
+```bash
+cargo fmt --all -- --check                              # must produce no diff
+cargo clippy --workspace --all-targets -- -D warnings   # must exit clean
+```
+
+Install the project's pre-commit hook to enforce this locally (it also runs the test suite):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+CI runs the same checks; PRs that don't pass will be sent back. Beyond that:
+
+- Follow existing patterns in the codebase.
+- Don't `#[allow(clippy::...)]` to silence a lint without first understanding what it's catching — real fixes only, except for genuinely-misfiring lints (rare).
 
 ## License
 

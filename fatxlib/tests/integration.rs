@@ -196,6 +196,50 @@ fn test_create_and_read_file() {
 }
 
 #[test]
+fn test_create_file_from_reader_roundtrip() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 256) as u8).collect();
+    let cursor = Cursor::new(payload.clone());
+    vol.create_file_from_reader("/streamed.bin", payload.len() as u64, cursor, None)
+        .expect("stream create");
+
+    let read = vol.read_file_by_path("/streamed.bin").expect("read back");
+    assert_eq!(read.len(), payload.len());
+    assert_eq!(read, payload);
+}
+
+#[test]
+fn test_create_file_from_reader_premature_eof_frees_chain() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    // Reader has only 100 bytes but we promise 50_000.
+    let short = vec![0xAAu8; 100];
+    let initial_free = vol.stats().expect("stats").free_clusters;
+
+    let result = vol.create_file_from_reader("/short.bin", 50_000, Cursor::new(short), None);
+    assert!(matches!(result, Err(FatxError::Io(_))), "got {:?}", result);
+
+    // The aborted file should not exist, and the cluster chain we allocated
+    // for it must be back in the free pool.
+    assert!(vol.read_file_by_path("/short.bin").is_err());
+    let final_free = vol.stats().expect("stats").free_clusters;
+    assert_eq!(
+        final_free, initial_free,
+        "premature-EOF must free every cluster it allocated"
+    );
+}
+
+#[test]
+fn test_create_file_from_reader_rejects_duplicate() {
+    let (_tmp, mut vol) = common::create_fatx_image(2);
+
+    vol.create_file("/dup.bin", b"x").expect("create initial");
+    let result = vol.create_file_from_reader("/dup.bin", 1, Cursor::new([0u8; 1]), None);
+    assert!(matches!(result, Err(FatxError::FileExists(_))));
+}
+
+#[test]
 fn test_create_empty_file() {
     let (_tmp, mut vol) = common::create_fatx_image(2);
 

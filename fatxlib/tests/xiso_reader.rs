@@ -1,5 +1,7 @@
 //! Integration tests for the xdvdfs-backed XISO reader.
 
+mod common;
+
 use std::fs::File;
 use std::io::Cursor;
 
@@ -79,6 +81,83 @@ fn streams_a_file_into_buffer() {
         .expect("read_into");
     assert_eq!(n as usize, sink.len());
     assert_eq!(n, first.size);
+}
+
+#[test]
+fn file_reader_matches_read_into() {
+    use std::io::Read;
+    let Some(mut img) = open_fixture() else {
+        return;
+    };
+    let files = img.walk_files().expect("walk");
+    let first = files.first().expect("at least one file in fixture").clone();
+
+    let mut via_read_into = Vec::new();
+    img.read_into(&first, &mut via_read_into, None, None)
+        .expect("read_into");
+
+    let mut via_reader = Vec::new();
+    img.file_reader(&first)
+        .read_to_end(&mut via_reader)
+        .expect("read_to_end");
+
+    assert_eq!(via_reader.len() as u64, first.size);
+    assert_eq!(
+        via_reader, via_read_into,
+        "file_reader output must match read_into byte for byte"
+    );
+}
+
+#[test]
+fn extract_fixture_into_fatx_volume() {
+    let Some(mut img) = open_fixture() else {
+        return;
+    };
+    let files = img.walk_files().expect("walk");
+    assert!(!files.is_empty(), "fixture must have at least one file");
+
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    for f in &files {
+        // Create parent directories as needed (e.g. /Media/).
+        let fatx_path = if f.path.starts_with('/') {
+            f.path.clone()
+        } else {
+            format!("/{}", f.path)
+        };
+        if let Some(slash) = fatx_path.rfind('/')
+            && slash > 0
+        {
+            let parent = &fatx_path[..slash];
+            // create_directory is strict on existence; ignore "already exists"
+            // because we may share parents across siblings.
+            match vol.create_directory(parent) {
+                Ok(()) | Err(fatxlib::error::FatxError::FileExists(_)) => {}
+                Err(e) => panic!("mkdir {parent}: {e}"),
+            }
+        }
+
+        let reader = img.file_reader(f);
+        vol.create_file_from_reader(&fatx_path, f.size, reader, None)
+            .unwrap_or_else(|e| panic!("stream {} -> {}: {}", f.path, fatx_path, e));
+    }
+
+    // Verify every extracted file matches what read_into produces.
+    for f in &files {
+        let fatx_path = if f.path.starts_with('/') {
+            f.path.clone()
+        } else {
+            format!("/{}", f.path)
+        };
+        let mut expected = Vec::new();
+        img.read_into(f, &mut expected, None, None)
+            .expect("read expected");
+        let got = vol.read_file_by_path(&fatx_path).expect("read fatx");
+        assert_eq!(
+            got, expected,
+            "extracted {fatx_path} does not match XISO source"
+        );
+    }
 }
 
 #[test]

@@ -1307,6 +1307,137 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         }
     }
 
+    /// Streaming variant of [`create_file`]: allocates a cluster chain for
+    /// `size` bytes up front, then pulls cluster-sized chunks from `reader`
+    /// and writes them in order. Lets callers create multi-GiB files
+    /// without materializing the whole payload in memory — the working set
+    /// is one cluster (typically 16 KiB).
+    ///
+    /// `reader` must produce exactly `size` bytes (the last chunk may be
+    /// short; it's zero-padded to a full cluster on disk). Premature EOF
+    /// returns an error and any clusters allocated so far are freed.
+    ///
+    /// `progress(written, total)` fires after each cluster write if provided.
+    ///
+    /// Strict semantics: if `path` already exists the call fails with
+    /// [`FatxError::FileExists`]; callers wanting overwrite must delete first
+    /// or build their own helper analogous to [`create_or_replace_file`].
+    pub fn create_file_from_reader<R: std::io::Read>(
+        &mut self,
+        path: &str,
+        size: u64,
+        mut reader: R,
+        mut progress: Option<&mut dyn FnMut(u64, u64)>,
+    ) -> Result<()> {
+        let (parent_path, filename) = split_path(path);
+        Self::validate_filename(filename)?;
+
+        if size > u32::MAX as u64 {
+            return Err(FatxError::Io(std::io::Error::other(format!(
+                "file too large for FATX directory entry ({} bytes > 4 GiB - 1)",
+                size
+            ))));
+        }
+
+        if self.resolve_path(path).is_ok() {
+            return Err(FatxError::FileExists(path.to_string()));
+        }
+
+        let parent = self.resolve_path(parent_path)?;
+        if !parent.attributes.contains(FileAttributes::DIRECTORY) {
+            return Err(FatxError::NotADirectory(parent_path.to_string()));
+        }
+
+        let cluster_size = self.superblock.cluster_size() as usize;
+        let clusters_needed = if size == 0 {
+            1
+        } else {
+            (size as usize).div_ceil(cluster_size)
+        };
+
+        let first_cluster = self.allocate_chain(clusters_needed)?;
+
+        let result = (|| -> Result<()> {
+            let chain = self.read_chain(first_cluster)?;
+            let mut written: u64 = 0;
+            let mut cluster_buf = vec![0u8; cluster_size];
+
+            for &cluster in &chain {
+                let remaining = size - written;
+                let want = (remaining as usize).min(cluster_size);
+                if want == 0 {
+                    break;
+                }
+                // Fill the buffer with exactly `want` bytes from the reader;
+                // anything past `want` keeps its zero padding from the alloc.
+                cluster_buf[..want].fill(0);
+                let mut filled = 0;
+                while filled < want {
+                    let n = reader.read(&mut cluster_buf[filled..want]).map_err(|e| {
+                        FatxError::Io(std::io::Error::other(format!("reader error: {e}")))
+                    })?;
+                    if n == 0 {
+                        return Err(FatxError::Io(std::io::Error::other(format!(
+                            "reader EOF after {} bytes; expected {}",
+                            written + filled as u64,
+                            size
+                        ))));
+                    }
+                    filled += n;
+                }
+                if want < cluster_size {
+                    cluster_buf[want..].fill(0);
+                }
+                self.write_cluster(cluster, &cluster_buf)?;
+                written += want as u64;
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(written, size);
+                }
+            }
+
+            let now = time::OffsetDateTime::now_utc();
+            let date = DirectoryEntry::encode_date(now.year() as u16, now.month() as u8, now.day());
+            let time = DirectoryEntry::encode_time(now.hour(), now.minute(), now.second());
+
+            let mut filename_raw = [0xFFu8; MAX_FILENAME_LEN];
+            let name_bytes = filename.as_bytes();
+            filename_raw[..name_bytes.len()].copy_from_slice(name_bytes);
+
+            let entry = DirectoryEntry {
+                filename_len: name_bytes.len() as u8,
+                attributes: FileAttributes::ARCHIVE,
+                filename_raw,
+                first_cluster,
+                file_size: size as u32,
+                creation_time: time,
+                creation_date: date,
+                write_time: time,
+                write_date: date,
+                access_time: time,
+                access_date: date,
+            };
+
+            self.add_dirent_to_directory(parent.first_cluster, &entry)?;
+            Ok(())
+        })();
+
+        if let Err(err) = result {
+            if let Err(cleanup_err) = self.free_chain(first_cluster) {
+                warn!(
+                    "create_file_from_reader cleanup for '{}' failed after error {}: {}",
+                    path, err, cleanup_err
+                );
+            }
+            return Err(err);
+        }
+
+        info!(
+            "Streamed file '{}' ({} bytes, {} clusters)",
+            filename, size, clusters_needed
+        );
+        Ok(())
+    }
+
     /// Create a new directory at the specified path.
     pub fn create_directory(&mut self, path: &str) -> Result<()> {
         let (parent_path, dirname) = split_path(path);

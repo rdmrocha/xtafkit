@@ -50,6 +50,18 @@ cargo test --workspace
 ```
 Library tests in `fatxlib/tests/` exercise the filesystem, title catalog, slot-aware display, STFS parser, and Account decryption. CLI integration tests in `tests/cli_integration.rs` exercise `ls`/`scan`/`mkimage` only.
 
+### fmt + clippy on every change (hard rule)
+**Every code change must end with `cargo fmt --all` applied and `cargo clippy --workspace --all-targets -- -D warnings` passing.** Both. Every time. No "I'll fix it in the next commit" — fix it in this one.
+
+```bash
+cargo fmt --all                                              # apply formatting
+cargo clippy --workspace --all-targets -- -D warnings        # zero tolerance for warnings
+```
+
+`.githooks/pre-commit` enforces this at the git layer (install with `git config core.hooksPath .githooks`), but the rule applies in the editor, not just at commit time. If clippy flags something, fix it before claiming completion. Don't `#[allow(...)]` to silence a warning without first understanding the lint — real fixes, except for genuinely-misfiring lints (rare).
+
+Claude should do this automatically after any `Edit` / `Write` to `*.rs` or `Cargo.toml`. No reminders needed.
+
 ### Bug-Driven Testing Rule
 **Every bug fix MUST include a regression test.** When a bug is found — whether from user reports, logs, or code review — write a test that reproduces the failure BEFORE fixing it, then verify the fix makes it pass. This applies to all crates. No exceptions. Claude should do this automatically without being asked.
 
@@ -71,7 +83,11 @@ cargo run -p fatxlib --example check_profile -- /path/to/profile-file
 - **Default branch**: `main`
 - Commit and push at each milestone (working feature, major fix, etc.)
 
+### XISO / disc-image support
+- `fatxlib::xiso` wraps `xdvdfs` (sync feature, no async runtime) and exposes `XisoImage::{open, walk_files, read_into, file_reader, read_at}` plus a `LAYOUTS` table for raw / XGD1 / XGD2 / XGD3 pre-partition offsets.
+- TUI upload (`u`) sniffs every local file with `XisoImage::open`. On a hit, the user is prompted **Extract contents (Y/n)** — default extracts via `IoCmd::ExtractXiso`, `n` falls back to raw `WriteFile`. Extraction streams each entry through `XisoFileReader` → `FatxVolume::create_file_from_reader`, which keeps the working set at one cluster regardless of image size.
+- Useful because Aurora / FreeStyle Dash / XBMC4XBOX scan the drive for loose `default.xex` / `default.xbe` and launch them directly; STFS-wrapped GoD packaging is **not** required for those dashboards.
+
 ## Future Work (Deferred)
 - Eager / deferred-sync auto-resolve for files inside STFS content-type folders (Marketplace/Arcade/etc.) — currently on-demand only
-- `extract-xiso` integration for on-the-fly ISO extraction during copy
-- `iso2god`-style ISO → Games-on-Demand conversion (cherry-picked from iso2god-rs, refactored for streaming)
+- `iso2god`-style ISO → Games-on-Demand conversion (cherry-picked from iso2god-rs, refactored for streaming) — needed only for Xbox 360 BC, which requires STFS GoD packages; alt-dashboard playback already works via the XISO extract flow above
