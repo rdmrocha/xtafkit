@@ -84,7 +84,7 @@ pub fn format_for_path(parent_path: &str, raw: &str) -> String {
 /// its own format (e.g. for an alternate sort-by-id display order).
 pub fn resolved_name_for_path(parent_path: &str, raw: &str) -> Option<String> {
     match folder_slot(parent_path) {
-        FolderSlot::Xuid => crate::xuids::lookup(raw).map(|s| s.to_string()),
+        FolderSlot::Xuid => crate::xuids::lookup(raw),
         FolderSlot::TitleId => u32::from_str_radix(raw, 16)
             .ok()
             .and_then(|id| crate::titles::lookup(id).map(|t| t.name.to_string())),

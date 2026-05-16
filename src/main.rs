@@ -1582,6 +1582,9 @@ fn main() {
     if let Some(cache_path) = fatxlib::titles::file_cache::default_path() {
         let _ = fatxlib::titles::file_cache::load_from(&cache_path);
     }
+    if let Some(cache_path) = fatxlib::xuids::profile_cache::default_path() {
+        let _ = fatxlib::xuids::profile_cache::load_from(&cache_path);
+    }
 
     // Mount and mkimage init their own loggers with their preferred format.
     // Only init the CLI logger for other subcommands.
@@ -1777,6 +1780,12 @@ fn main() {
                 eprintln!("Error: {}", e);
                 process::exit(1);
             });
+            // Eager: when listing /Content, probe each personal XUID for a
+            // profile package so the gamertag shows up in the listing below.
+            // JSON output stays untouched per the locked rule.
+            if fatxlib::display::folder_slot(&path) == fatxlib::display::FolderSlot::Xuid {
+                let _ = fatxlib::xuids::resolve_profile_xuids(&mut vol, &entries, true);
+            }
             if json {
                 let je: Vec<JsonDirEntry> = entries.iter().map(dirent_to_json).collect();
                 println!("{}", serde_json::to_string_pretty(&je).unwrap());

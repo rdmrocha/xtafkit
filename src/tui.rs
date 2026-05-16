@@ -348,6 +348,16 @@ fn io_worker(
 
                 match vol.read_directory(entry.first_cluster) {
                     Ok(entries) => {
+                        // Eager: when listing /Content, probe each personal
+                        // XUID for a profile package so the gamertag is
+                        // already in the cache by the time we render.
+                        if fatxlib::display::folder_slot(&path)
+                            == fatxlib::display::FolderSlot::Xuid
+                        {
+                            let _ = fatxlib::xuids::resolve_profile_xuids(
+                                &mut vol, &entries, true,
+                            );
+                        }
                         let display: Vec<DisplayEntry> = entries
                             .iter()
                             .map(|e| {
