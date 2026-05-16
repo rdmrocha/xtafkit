@@ -24,19 +24,6 @@ base64 = "0.22"
 ratatui = "0.30"
 crossterm = "0.29"
 rand = "0.8"
-nfsserve = "0.11"
-tokio = { version = "1", features = ["full"] }
-async-trait = "0.1"
-parking_lot = "0.12"
-quick_cache = "0.6"
-bytes = "1"
-ctrlc = "3"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = "0.10"
-core-foundation-sys = "0.8"
-io-kit-sys = "0.5"
-mach2 = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

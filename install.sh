@@ -31,8 +31,6 @@ ok()    { echo -e "  ${GREEN}✓ $1${NC}"; }
 warn()  { echo -e "  ${YELLOW}⚠ $1${NC}"; }
 fail()  { echo -e "  ${RED}✗ $1${NC}"; exit 1; }
 
-# ── Check platform ──────────────────────────────────────────────────────────
-
 echo ""
 info "xtafkit installer"
 echo ""
@@ -52,17 +50,8 @@ esac
 
 ok "Detected macOS $ARCH"
 
-# ── Check dependencies ──────────────────────────────────────────────────────
-
-if ! command -v curl &>/dev/null; then
-    fail "curl is required but not found"
-fi
-
-if ! command -v tar &>/dev/null; then
-    fail "tar is required but not found"
-fi
-
-# ── Determine version ───────────────────────────────────────────────────────
+command -v curl &>/dev/null || fail "curl is required but not found"
+command -v tar  &>/dev/null || fail "tar is required but not found"
 
 if [[ -n "$XTAFKIT_VERSION" ]]; then
     VERSION="$XTAFKIT_VERSION"
@@ -71,20 +60,13 @@ else
     info "Finding latest release..."
     VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
         | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-
     if [[ -z "$VERSION" ]]; then
-        # No full release yet — try latest tag
         VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/tags" \
             | grep '"name"' | head -1 | cut -d'"' -f4)
     fi
-
-    if [[ -z "$VERSION" ]]; then
-        fail "Could not determine latest version. Set XTAFKIT_VERSION manually."
-    fi
+    [[ -z "$VERSION" ]] && fail "Could not determine latest version. Set XTAFKIT_VERSION manually."
     ok "Latest version: $VERSION"
 fi
-
-# ── Download ────────────────────────────────────────────────────────────────
 
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET_NAME.tar.gz"
 TMP_DIR=$(mktemp -d)
@@ -99,10 +81,6 @@ if [[ "$HTTP_CODE" != "200" ]] || [[ ! -s "$TMP_DIR/xtafkit.tar.gz" ]]; then
     echo ""
     warn "No prebuilt binary found for $VERSION ($ASSET_NAME)."
     echo ""
-    echo -e "  This can happen if:"
-    echo -e "  - The release hasn't published binaries yet"
-    echo -e "  - This is a pre-release tag"
-    echo ""
     echo -e "  ${BOLD}Build from source instead:${NC}"
     echo -e "    git clone https://github.com/$REPO.git"
     echo -e "    cd xtafkit"
@@ -113,43 +91,27 @@ fi
 
 ok "Downloaded $(du -h "$TMP_DIR/xtafkit.tar.gz" | cut -f1 | xargs) archive"
 
-# ── Extract ─────────────────────────────────────────────────────────────────
-
 info "Extracting..."
 tar xzf "$TMP_DIR/xtafkit.tar.gz" -C "$TMP_DIR"
 
-# Verify binaries exist
 for bin in $BINARIES; do
-    if [[ ! -f "$TMP_DIR/$bin" ]]; then
-        fail "Expected binary '$bin' not found in archive"
-    fi
+    [[ -f "$TMP_DIR/$bin" ]] || fail "Expected binary '$bin' not found in archive"
 done
-
 ok "Extracted: $BINARIES"
-
-# ── Install ─────────────────────────────────────────────────────────────────
 
 info "Installing to $INSTALL_DIR..."
 
-# Create install dir if it doesn't exist
 if [[ ! -d "$INSTALL_DIR" ]]; then
-    if [[ -w "$(dirname "$INSTALL_DIR")" ]]; then
-        mkdir -p "$INSTALL_DIR"
-    else
-        sudo mkdir -p "$INSTALL_DIR"
-    fi
+    if [[ -w "$(dirname "$INSTALL_DIR")" ]]; then mkdir -p "$INSTALL_DIR"
+    else sudo mkdir -p "$INSTALL_DIR"; fi
 fi
 
-# Remove pre-rename binaries if present (the project used to ship as `fatx`,
-# `fatx-mount`, `fatx-mkimage` before the xtafkit rename).
+# Sweep legacy binaries from the pre-rename / pre-cleanup history.
 OLD_BINARIES="fatx fatx-mount fatx-mkimage"
 for old_bin in $OLD_BINARIES; do
     if [[ -f "$INSTALL_DIR/$old_bin" ]]; then
-        if [[ -w "$INSTALL_DIR" ]]; then
-            rm -f "$INSTALL_DIR/$old_bin"
-        else
-            sudo rm -f "$INSTALL_DIR/$old_bin"
-        fi
+        if [[ -w "$INSTALL_DIR" ]]; then rm -f "$INSTALL_DIR/$old_bin"
+        else sudo rm -f "$INSTALL_DIR/$old_bin"; fi
         ok "Removed legacy binary $INSTALL_DIR/$old_bin"
     fi
 done
@@ -165,8 +127,6 @@ for bin in $BINARIES; do
     ok "Installed $INSTALL_DIR/$bin"
 done
 
-# ── Verify ──────────────────────────────────────────────────────────────────
-
 echo ""
 if command -v xtafkit &>/dev/null; then
     INSTALLED_VER=$(xtafkit --version 2>/dev/null || echo "unknown")
@@ -177,8 +137,6 @@ else
     echo "    export PATH=\"$INSTALL_DIR:\$PATH\""
 fi
 
-# ── Quick start ─────────────────────────────────────────────────────────────
-
 echo ""
 info "Quick start"
 echo ""
@@ -187,9 +145,7 @@ echo ""
 echo -e "    ${GREEN}diskutil list | grep external${NC}                    # find your device"
 echo -e "    ${GREEN}diskutil unmountDisk /dev/diskN${NC}                  # unmount macOS"
 echo -e "    ${GREEN}sudo xtafkit scan /dev/rdiskN${NC}                    # find Xbox partitions"
-echo -e "    ${GREEN}sudo xtafkit ls /dev/rdiskN --partition \"360 Data\" /${NC}  # list files"
-echo -e "    ${GREEN}sudo xtafkit mount /dev/rdiskN --partition \"360 Data\" --mount${NC}  # Finder"
-echo -e "    ${GREEN}sudo xtafkit${NC}                                      # interactive mode"
+echo -e "    ${GREEN}sudo xtafkit${NC}                                      # launch TUI"
 echo ""
 echo -e "  For full help: ${DIM}xtafkit --help${NC}"
 echo ""
