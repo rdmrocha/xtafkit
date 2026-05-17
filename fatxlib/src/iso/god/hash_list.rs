@@ -59,3 +59,49 @@ impl HashList {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn read_preserves_fixed_bytes_and_len() {
+        let mut bytes = [0u8; 4096];
+        bytes[..20].fill(0x11);
+        bytes[40..60].fill(0x22);
+
+        let list = HashList::read(Cursor::new(bytes)).expect("read hash list");
+        assert_eq!(&list.bytes()[..20], &[0x11; 20]);
+        assert_eq!(&list.bytes()[20..40], &[0x00; 20]);
+        assert_eq!(&list.bytes()[40..60], &[0x22; 20]);
+    }
+
+    #[test]
+    fn write_emits_exact_fixed_buffer() {
+        let mut list = HashList::new();
+        list.add_hash(&[0x11; 20]);
+        list.add_hash(&[0x22; 20]);
+
+        let mut out = Vec::new();
+        list.write(&mut out).expect("write hash list");
+
+        assert_eq!(out.len(), 4096);
+        assert_eq!(&out[..20], &[0x11; 20]);
+        assert_eq!(&out[20..40], &[0x22; 20]);
+        assert!(out[40..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn digest_matches_known_zero_page() {
+        let list = HashList::new();
+        assert_eq!(
+            list.digest(),
+            [
+                0x1c, 0xea, 0xf7, 0x3d, 0xf4, 0x0e, 0x53, 0x1d, 0xf3, 0xbf, 0xb2, 0x6b, 0x4f, 0xb7,
+                0xcd, 0x95, 0xfb, 0x7b, 0xff, 0x1d,
+            ]
+        );
+    }
+}

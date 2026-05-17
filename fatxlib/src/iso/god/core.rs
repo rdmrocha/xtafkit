@@ -136,6 +136,7 @@ mod tests {
     use super::*;
     use crate::executable::TitleExecutionInfo;
     use crate::iso::god::prepare::test_prepared_source;
+    use std::io::Cursor;
 
     struct TestSink {
         masters: Vec<HashList>,
@@ -203,10 +204,10 @@ mod tests {
         }
     }
 
-    fn make_hash_list(seed: u8) -> HashList {
-        let mut list = HashList::new();
-        list.add_hash(&[seed; 20]);
-        list
+    fn hash_list_from_seed(seed: u8) -> HashList {
+        let mut bytes = [0u8; 4096];
+        bytes[..20].fill(seed);
+        HashList::read(Cursor::new(bytes)).expect("seeded hash list")
     }
 
     #[test]
@@ -215,9 +216,9 @@ mod tests {
             title_id: 0x4D53_07E6,
             media_id: 0x1234_5678,
             content_type: super::super::ContentType::GamesOnDemand,
-            part_count: 2,
-            block_count: 2,
-            data_size: BLOCK_SIZE * BLOCKS_PER_PART,
+            part_count: 3,
+            block_count: 3,
+            data_size: BLOCK_SIZE * BLOCKS_PER_PART * 2,
         };
         let source = test_prepared_source(
             report,
@@ -233,19 +234,35 @@ mod tests {
             },
             super::super::ContentType::GamesOnDemand,
         );
-        let part0 = make_hash_list(0x11);
-        let part1 = make_hash_list(0x22);
-        let mut sink = TestSink::new(vec![part0.clone(), part1.clone()], BLOCK_SIZE);
+        let part0 = hash_list_from_seed(0x11);
+        let part1 = hash_list_from_seed(0x22);
+        let part2 = hash_list_from_seed(0x33);
+        let mut sink = TestSink::new(
+            vec![part0.clone(), part1.clone(), part2.clone()],
+            BLOCK_SIZE,
+        );
         let mut opts = ConvertOptions::default();
 
         let result = run_conversion(&source, &mut sink, &mut opts, "test").expect("conversion");
-        assert_eq!(result.part_count, 2);
-        assert_eq!(sink.writes.len(), 1);
+        assert_eq!(result.part_count, 3);
+        assert_eq!(sink.writes.len(), 2);
 
-        let mut expected = part0;
-        expected.add_hash(&part1.digest());
-        assert_eq!(sink.writes[0].0, 0);
-        assert_eq!(sink.writes[0].1, expected.digest());
+        assert_eq!(sink.writes[0].0, 1);
+        assert_eq!(
+            sink.writes[0].1,
+            [
+                0x6a, 0xb0, 0xca, 0x46, 0x1a, 0x72, 0xcf, 0x70, 0x51, 0x79, 0xa1, 0xf3, 0x08, 0x8b,
+                0x54, 0xfa, 0x4d, 0xd4, 0xfa, 0x24,
+            ]
+        );
+        assert_eq!(sink.writes[1].0, 0);
+        assert_eq!(
+            sink.writes[1].1,
+            [
+                0xe9, 0x63, 0x9e, 0x2e, 0x25, 0xf0, 0x3c, 0x58, 0xa2, 0x07, 0xb7, 0xad, 0x9b, 0x27,
+                0x4e, 0xa5, 0x5b, 0x61, 0x15, 0x0d,
+            ]
+        );
         assert!(sink.con_header.is_some());
     }
 }

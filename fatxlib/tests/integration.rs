@@ -6,6 +6,7 @@
 mod common;
 
 use std::cell::RefCell;
+use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
 use std::thread::sleep;
@@ -19,10 +20,17 @@ use fatxlib::volume::FatxVolume;
 struct FailingWriteState {
     fail_on_write: Option<usize>,
     writes_seen: usize,
+    block_writes_after_flush: bool,
+    seen_flush: bool,
 }
 
 struct FailingWriteCursor {
     inner: Cursor<Vec<u8>>,
+    state: Rc<RefCell<FailingWriteState>>,
+}
+
+struct FailingWriteFile {
+    inner: File,
     state: Rc<RefCell<FailingWriteState>>,
 }
 
@@ -41,6 +49,9 @@ impl Seek for FailingWriteCursor {
 impl Write for FailingWriteCursor {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut state = self.state.borrow_mut();
+        if state.block_writes_after_flush && state.seen_flush {
+            return Err(std::io::Error::other("injected post-flush write failure"));
+        }
         state.writes_seen += 1;
         if state.fail_on_write == Some(state.writes_seen) {
             return Err(std::io::Error::other("injected write failure"));
@@ -49,7 +60,45 @@ impl Write for FailingWriteCursor {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        let result = self.inner.flush();
+        if result.is_ok() {
+            self.state.borrow_mut().seen_flush = true;
+        }
+        result
+    }
+}
+
+impl Read for FailingWriteFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for FailingWriteFile {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl Write for FailingWriteFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut state = self.state.borrow_mut();
+        if state.block_writes_after_flush && state.seen_flush {
+            return Err(std::io::Error::other("injected post-flush write failure"));
+        }
+        state.writes_seen += 1;
+        if state.fail_on_write == Some(state.writes_seen) {
+            return Err(std::io::Error::other("injected write failure"));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let result = self.inner.flush();
+        if result.is_ok() {
+            self.state.borrow_mut().seen_flush = true;
+        }
+        result
     }
 }
 
@@ -887,6 +936,58 @@ fn test_write_in_place_file_grows() {
     // Should have used more clusters
     let stats_big = vol.stats().expect("stats");
     assert!(stats_big.free_clusters < stats_small.free_clusters);
+}
+
+#[test]
+fn test_write_in_place_flushes_fat_before_data_write() {
+    let (tmp, mut vol) = common::create_fatx_image(4);
+
+    vol.create_file("/grow.bin", &[0x11; 100]).expect("create");
+    vol.flush().expect("flush initial image");
+    let original_entry = vol.resolve_path("/grow.bin").expect("resolve original");
+    let original_chain_len = vol
+        .read_chain(original_entry.first_cluster)
+        .expect("read original chain")
+        .len();
+    drop(vol);
+
+    let img_path = common::image_path(&tmp);
+    let state = Rc::new(RefCell::new(FailingWriteState {
+        block_writes_after_flush: true,
+        ..Default::default()
+    }));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("open image");
+    let wrapper = FailingWriteFile {
+        inner: file,
+        state: Rc::clone(&state),
+    };
+    let mut vol = FatxVolume::open(wrapper, 0, 0).expect("open with flush-failing wrapper");
+
+    let result = vol.write_file_in_place("/grow.bin", &vec![0x22; 50000]);
+    assert!(
+        result.is_err(),
+        "injected post-flush failure should abort write"
+    );
+    drop(vol);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("reopen image");
+    let mut reopened = FatxVolume::open(file, 0, 0).expect("reopen volume");
+    let entry = reopened.resolve_path("/grow.bin").expect("resolve after");
+    let chain_len = reopened
+        .read_chain(entry.first_cluster)
+        .expect("read chain after");
+    assert!(
+        chain_len.len() > original_chain_len,
+        "FAT extension should persist before data write failure"
+    );
 }
 
 /// In-place write where file shrinks — must free excess clusters.

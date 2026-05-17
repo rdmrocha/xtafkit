@@ -1516,6 +1516,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
             self.write_fat_entry(last_old, FatEntry::Next(new_clusters[0]))?;
             self.link_allocated_clusters(&new_clusters)?;
+            self.flush()?;
 
             // Re-read chain after the extension is linked into the FAT cache.
             chain = self.read_chain(target.first_cluster)?;
