@@ -28,13 +28,14 @@
 pub mod content_types;
 pub mod display;
 pub mod error;
+pub mod executable;
+pub mod iso;
 pub mod partition;
 pub mod platform;
 pub mod stfs;
 pub mod titles;
 pub mod types;
 pub mod volume;
-pub mod xiso;
 pub mod xuids;
 
 pub use error::{FatxError, Result};

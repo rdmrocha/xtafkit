@@ -172,6 +172,50 @@ enum Commands {
         #[arg(long)]
         no_save: bool,
     },
+    /// Extract every file from an Xbox / Xbox 360 XISO disc image to a
+    /// local directory. Useful for inspecting an ISO's contents or for
+    /// feeding loose game files to alt dashboards.
+    Extract {
+        /// Source XISO file
+        iso: PathBuf,
+        /// Destination directory (created if missing)
+        dest: PathBuf,
+        /// Skip the `$SystemUpdate` folder (dashboard update payload that
+        /// alt dashboards never run). On by default; pass
+        /// `--keep-systemupdate` to write it out anyway.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        keep_systemupdate: bool,
+        /// Print what would be extracted without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Convert an Xbox 360 XISO into a Games-on-Demand package in a local
+    /// directory. Writes `<dest>/<TitleID>/<ContentType>/<MediaID>{,.data/}`.
+    God {
+        /// Source XISO file
+        iso: PathBuf,
+        /// Destination directory (the title-id tree lands underneath)
+        dest: PathBuf,
+        /// How much of the source partition to pack:
+        ///   `compact` (default) — rebuild a dense XDVDFS image first, then
+        ///   convert that compact image into GoD.
+        ///   `preserve-layout` — walk the file tree, pack only
+        ///   through the highest used extent while preserving mastered
+        ///   holes inside the XDVDFS layout.
+        ///   `none` — pack everything from the start of the data partition
+        ///   to the end of the source file.
+        #[arg(long, value_parser = ["compact", "preserve-layout", "none"], default_value = "compact")]
+        trim: String,
+        /// Print the parsed metadata (TitleID, MediaID, data_size, part_count)
+        /// without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the human-readable title written into the CON header.
+        /// Defaults to the catalog name for the parsed TitleID, or blank
+        /// if the catalog doesn't know it.
+        #[arg(long)]
+        game_title: Option<String>,
+    },
 }
 
 // ===========================================================================
@@ -1087,5 +1131,385 @@ fn main() {
                 }
             }
         }
+
+        Some(Commands::Extract {
+            iso,
+            dest,
+            keep_systemupdate,
+            dry_run,
+        }) => run_extract(&iso, &dest, keep_systemupdate, dry_run, json),
+
+        Some(Commands::God {
+            iso,
+            dest,
+            trim,
+            dry_run,
+            game_title,
+        }) => run_god(&iso, &dest, &trim, dry_run, game_title.as_deref(), json),
     }
+}
+
+// ===========================================================================
+// `xtafkit extract` — XISO → local directory
+// ===========================================================================
+
+fn run_extract(
+    iso: &std::path::Path,
+    dest: &std::path::Path,
+    keep_systemupdate: bool,
+    dry_run: bool,
+    json: bool,
+) {
+    use std::io::BufWriter;
+    use std::time::Instant;
+
+    let file = match File::open(iso) {
+        Ok(f) => f,
+        Err(e) => {
+            cli_error(json, &format!("open {}: {}", iso.display(), e));
+            return;
+        }
+    };
+    let mut img = match fatxlib::iso::image::XisoImage::open(file) {
+        Ok(i) => i,
+        Err(e) => {
+            cli_error(json, &format!("parse {}: {}", iso.display(), e));
+            return;
+        }
+    };
+    let plan = match fatxlib::iso::manifest::build_manifest(
+        &mut img,
+        fatxlib::iso::manifest::IsoFilterPolicy { keep_systemupdate },
+    ) {
+        Ok(plan) => plan,
+        Err(e) => {
+            cli_error(json, &format!("walk {}: {}", iso.display(), e));
+            return;
+        }
+    };
+    let total_files = plan.kept_files();
+    let total_bytes = plan.kept_bytes;
+    let skipped_files = plan.skipped_files();
+    let skipped_bytes = plan.skipped_bytes;
+
+    if dry_run {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "iso": iso.display().to_string(),
+                    "layout": plan.layout,
+                    "files": total_files,
+                    "bytes": total_bytes,
+                    "skipped_files": skipped_files,
+                    "skipped_bytes": skipped_bytes,
+                    "entries": plan.entries.iter().map(|e| {
+                        serde_json::json!({
+                            "path": e.file.path,
+                            "offset": e.file.offset,
+                            "size": e.file.size,
+                            "skipped": e.skipped,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            );
+        } else {
+            println!("ISO:      {}", iso.display());
+            println!("Layout:   {}", plan.layout);
+            println!("Files:    {} ({})", total_files, format_size(total_bytes));
+            if skipped_files > 0 {
+                println!(
+                    "Skipped:  {} files in $SystemUpdate ({})",
+                    skipped_files,
+                    format_size(skipped_bytes)
+                );
+            }
+            println!();
+            for e in &plan.entries {
+                let tag = if e.skipped { "skip " } else { "keep " };
+                println!(
+                    "  {} {:48}  @0x{:010X}  {}",
+                    tag,
+                    e.file.path,
+                    e.file.offset,
+                    format_size(e.file.size)
+                );
+            }
+            println!();
+            println!("(dry-run; nothing written)");
+        }
+        return;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(dest) {
+        cli_error(json, &format!("create_dir_all {}: {}", dest.display(), e));
+        return;
+    }
+
+    let started = Instant::now();
+    let mut files_done = 0usize;
+    let mut bytes_done: u64 = 0;
+    let last_progress = std::cell::Cell::new(Instant::now());
+
+    for e in plan.kept() {
+        let normalized = e.path.replace('\\', "/");
+        let local = dest.join(&normalized);
+        if let Some(parent) = local.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            cli_error(
+                json,
+                &format!("create_dir_all {}: {}", parent.display(), err),
+            );
+            return;
+        }
+        let out = match File::create(&local) {
+            Ok(f) => BufWriter::new(f),
+            Err(err) => {
+                cli_error(json, &format!("create {}: {}", local.display(), err));
+                return;
+            }
+        };
+        let mut out = out;
+        let bytes_done_ref = &mut bytes_done;
+        let last_progress_ref = &last_progress;
+        let mut cb = |read: u64, _total: u64| {
+            // Throttled per-file byte progress for stderr.
+            if !json && last_progress_ref.get().elapsed().as_millis() > 250 {
+                eprint!(
+                    "\r  [{}/{}] {} ({}/{})         ",
+                    files_done + 1,
+                    total_files,
+                    short_name(&normalized),
+                    format_size(*bytes_done_ref + read),
+                    format_size(total_bytes),
+                );
+                let _ = io::stderr().flush();
+                last_progress_ref.set(Instant::now());
+            }
+        };
+        let written = match img.read_into(e, &mut out, None, Some(&mut cb)) {
+            Ok(n) => n,
+            Err(err) => {
+                if !json {
+                    eprintln!();
+                }
+                cli_error(json, &format!("read {}: {}", e.path, err));
+                return;
+            }
+        };
+        if let Err(err) = out.flush() {
+            cli_error(json, &format!("flush {}: {}", local.display(), err));
+            return;
+        }
+        bytes_done += written;
+        files_done += 1;
+    }
+    let elapsed = started.elapsed();
+    if !json {
+        eprint!("\r{:80}\r", "");
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "iso": iso.display().to_string(),
+                "dest": dest.display().to_string(),
+                "files": files_done,
+                "bytes": bytes_done,
+                "skipped_files": skipped_files,
+                "skipped_bytes": skipped_bytes,
+                "elapsed_secs": elapsed.as_secs_f64(),
+            })
+        );
+    } else {
+        println!(
+            "Extracted {} files ({}) → {} in {:?}",
+            files_done,
+            format_size(bytes_done),
+            dest.display(),
+            elapsed,
+        );
+        if skipped_files > 0 {
+            println!(
+                "Skipped {} files in $SystemUpdate ({})",
+                skipped_files,
+                format_size(skipped_bytes)
+            );
+        }
+    }
+}
+
+fn short_name(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
+}
+
+// ===========================================================================
+// `xtafkit god` — XISO → local Games-on-Demand package
+// ===========================================================================
+
+fn run_god(
+    iso: &std::path::Path,
+    dest: &std::path::Path,
+    trim: &str,
+    dry_run: bool,
+    game_title: Option<&str>,
+    json: bool,
+) {
+    use std::time::Instant;
+
+    let trim_mode = match trim {
+        "preserve-layout" => fatxlib::iso::god::TrimMode::PreserveLayout,
+        "none" => fatxlib::iso::god::TrimMode::None,
+        "compact" => fatxlib::iso::god::TrimMode::Compact,
+        other => {
+            cli_error(json, &format!("invalid --trim {:?}", other));
+            return;
+        }
+    };
+
+    // Catalog-fill the game title from the dry-run report, unless the
+    // caller passed --game-title explicitly.
+    let mut dry_opts = fatxlib::iso::god::ConvertOptions {
+        trim: trim_mode,
+        dry_run: true,
+        ..Default::default()
+    };
+    let report = match fatxlib::iso::god::convert_iso(iso, dest, &mut dry_opts) {
+        Ok(r) => r,
+        Err(e) => {
+            cli_error(json, &format!("parse {}: {}", iso.display(), e));
+            return;
+        }
+    };
+    let resolved_name = fatxlib::titles::lookup(report.title_id).map(|t| t.name);
+    let effective_title = game_title.or(resolved_name);
+
+    if dry_run {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "iso": iso.display().to_string(),
+                    "title_id": format!("{:08X}", report.title_id),
+                    "media_id": format!("{:08X}", report.media_id),
+                    "name": resolved_name.unwrap_or("(unknown)"),
+                    "content_type": format!("{:?}", report.content_type),
+                    "data_size": report.data_size,
+                    "block_count": report.block_count,
+                    "part_count": report.part_count,
+                })
+            );
+        } else {
+            println!("ISO:         {}", iso.display());
+            println!("Title ID:    {:08X}", report.title_id);
+            println!("Media ID:    {:08X}", report.media_id);
+            println!(
+                "Name:        {}",
+                resolved_name.unwrap_or("(unknown — catalog miss)")
+            );
+            println!("Content:     {:?}", report.content_type);
+            println!(
+                "Data size:   {} bytes ({})",
+                report.data_size,
+                format_size(report.data_size)
+            );
+            println!("Block count: {}", report.block_count);
+            println!("Part count:  {}", report.part_count);
+            println!();
+            println!("(dry-run; nothing written)");
+        }
+        return;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(dest) {
+        cli_error(json, &format!("create_dir_all {}: {}", dest.display(), e));
+        return;
+    }
+
+    let started = Instant::now();
+    let last_progress = std::cell::Cell::new(Instant::now());
+    let mut last_stage = String::new();
+    let mut progress_cb = |stage: &str, current: u64, total: u64| {
+        let stage_changed = stage != last_stage;
+        if json {
+            return;
+        }
+        if stage_changed || last_progress.get().elapsed().as_millis() > 250 {
+            if stage.starts_with("part ") {
+                eprint!(
+                    "\r  [{}] {} / {}            ",
+                    stage,
+                    format_size(current),
+                    format_size(total)
+                );
+            } else {
+                eprint!("\r  [{}] {}/{}            ", stage, current, total);
+            }
+            let _ = io::stderr().flush();
+            last_progress.set(Instant::now());
+            last_stage = stage.to_string();
+        }
+    };
+
+    let mut opts = fatxlib::iso::god::ConvertOptions {
+        trim: trim_mode,
+        game_title: effective_title,
+        dry_run: false,
+        progress: Some(&mut progress_cb),
+        should_abort: None,
+    };
+
+    let result = fatxlib::iso::god::convert_iso(iso, dest, &mut opts);
+    if !json {
+        eprint!("\r{:80}\r", "");
+    }
+    let elapsed = started.elapsed();
+    match result {
+        Ok(r) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "iso": iso.display().to_string(),
+                        "dest": dest.display().to_string(),
+                        "title_id": format!("{:08X}", r.title_id),
+                        "media_id": format!("{:08X}", r.media_id),
+                        "name": resolved_name.unwrap_or("(unknown)"),
+                        "content_type": format!("{:?}", r.content_type),
+                        "data_size": r.data_size,
+                        "block_count": r.block_count,
+                        "part_count": r.part_count,
+                        "elapsed_secs": elapsed.as_secs_f64(),
+                    })
+                );
+            } else {
+                let resolved_label = resolved_name.unwrap_or("(unknown — catalog miss)");
+                println!(
+                    "ISO:         {}\nTitle ID:    {:08X}\nMedia ID:    {:08X}\nName:        {}\nContent:     {:?}\nData size:   {} bytes ({})\nBlock count: {}\nPart count:  {}\nDest:        {}\nElapsed:     {:?}",
+                    iso.display(),
+                    r.title_id,
+                    r.media_id,
+                    resolved_label,
+                    r.content_type,
+                    r.data_size,
+                    format_size(r.data_size),
+                    r.block_count,
+                    r.part_count,
+                    dest.display(),
+                    elapsed
+                );
+            }
+        }
+        Err(e) => cli_error(json, &format!("convert_iso: {}", e)),
+    }
+}
+
+fn cli_error(json: bool, msg: &str) {
+    if json {
+        println!("{}", serde_json::json!({"error": msg}));
+        process::exit(0);
+    }
+    eprintln!("Error: {}", msg);
+    process::exit(1);
 }

@@ -16,9 +16,13 @@
 //!   d                 Download selected file to local disk
 //!   u                 Upload a local file or directory into current directory.
 //!                     If the file parses as an XDVDFS/XISO disc image, the
-//!                     TUI asks whether to extract the contents into a new
-//!                     subfolder (preferred for alt dashboards) or copy the
-//!                     raw bytes as-is.
+//!                     TUI asks how to bring it onto the drive:
+//!                       (x)tract — stream the file tree into <cwd>/<stem>/
+//!                       (g)oD    — convert to a Games-on-Demand package
+//!                                  rooted at <cwd>/<TitleID>/00007000/...
+//!                       (r)aw    — copy the source ISO byte-for-byte
+//!                     Default is GoD when cwd is inside `/Content/<XUID>/`,
+//!                     extract otherwise.
 //!   m                 Create new directory (mkdir)
 //!   D                 Delete selected file/directory
 //!   r                 Rename selected file/directory
@@ -57,10 +61,10 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
+use fatxlib::iso::image::XisoImage;
 use fatxlib::partition::format_size;
 use fatxlib::types::FileAttributes;
 use fatxlib::volume::FatxVolume;
-use fatxlib::xiso::XisoImage;
 
 // ===========================================================================
 // Display types
@@ -107,6 +111,24 @@ impl DisplayEntry {
     }
 }
 
+/// What to do with a local XISO that's being uploaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XisoUploadAction {
+    /// Walk the XISO and stream each file into `<cwd>/<iso-stem>/`.
+    /// Default when cwd is anywhere other than directly inside an XUID
+    /// folder (e.g. `/Games/`, `/`, an arbitrary user folder).
+    Extract,
+    /// Convert the XISO into a Games-on-Demand package — writes
+    /// `<cwd>/<TitleID>/00007000/<MediaID>{,.data/}`. Default when cwd
+    /// is directly inside `/Content/<XUID>/`, since that's exactly
+    /// where Xbox 360 BC looks for GoD packages.
+    God,
+    /// Copy the source ISO byte-for-byte to `<cwd>/<filename>`. Useful
+    /// when the user wants to preserve the disc image as-is for later
+    /// extraction or conversion elsewhere.
+    Raw,
+}
+
 /// How to order the directory listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortMode {
@@ -142,6 +164,15 @@ enum IoCmd {
     /// `dest_dir` on the FATX volume, recreating the directory tree. The dest
     /// directory itself is created by the worker; it must not already exist.
     ExtractXiso {
+        source: PathBuf,
+        dest_dir: String,
+    },
+    /// Convert `source` (an XDVDFS image) to a Games-on-Demand package
+    /// rooted at `dest_dir` on the FATX volume. Writes
+    /// `<dest_dir>/<TitleID>/00007000/<MediaID>{,.data/Data0000..N}`.
+    /// The worker resolves the human-readable game title from
+    /// [`fatxlib::titles`] before writing the CON header.
+    ConvertXisoToGod {
         source: PathBuf,
         dest_dir: String,
     },
@@ -223,9 +254,12 @@ enum InputMode {
     RenameName,
     ConfirmDelete,
     ConfirmCleanup,
-    /// Confirmation prompt after detecting an XISO during upload — y extracts
-    /// the contents, n falls back to a raw byte copy.
-    ConfirmExtractXiso,
+    /// Three-way prompt after detecting an XISO during upload:
+    /// `x` extracts the contents into a stem-named subfolder,
+    /// `g` converts to a Games-on-Demand package (Title-ID tree under cwd),
+    /// `r` falls back to a raw byte copy of the source file.
+    /// The default action on bare Enter depends on cwd context.
+    ConfirmXisoUpload,
 }
 
 struct App {
@@ -247,9 +281,9 @@ struct App {
     cancel_flag: Arc<AtomicBool>,
     /// Pending cleanup paths awaiting user confirmation.
     pending_cleanup: Vec<(String, bool, u64)>,
-    /// Local XISO path stashed between the upload prompt and the
-    /// "extract or raw copy?" confirmation prompt.
-    pending_xiso_upload: Option<PathBuf>,
+    /// Local XISO path + default action stashed between the upload prompt
+    /// and the three-way confirmation prompt (extract / GoD / raw).
+    pending_xiso_upload: Option<(PathBuf, XisoUploadAction)>,
     /// Current listing sort order. Toggleable with `s`.
     sort_mode: SortMode,
 }
@@ -282,18 +316,54 @@ fn is_xiso(path: &std::path::Path) -> bool {
     }
 }
 
-/// Image-relative paths we always strip when extracting an XISO. Currently
-/// just `$SystemUpdate/*` — dashboard update payload that alt dashboards
-/// never launch and that wastes tens to hundreds of MiB on the destination
-/// drive. `image_path` is expected to use forward slashes; the match is
-/// case-insensitive against the first segment.
-fn is_xiso_junk(image_path: &str) -> bool {
-    let first = image_path
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("");
-    first.eq_ignore_ascii_case("$SystemUpdate")
+/// Resolve the destination folder name for an XISO extract by reading the
+/// embedded `Default.xex` / `default.xbe` and looking the TitleID up in
+/// [`fatxlib::titles`]. Returns the catalog-known game name, sanitized for
+/// FATX's filename rules. Returns `None` if the image has no parsable
+/// executable, the TitleID isn't in the catalog, or the resulting name is
+/// empty after sanitization — callers should fall back to the file stem.
+fn xiso_folder_name(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut img = XisoImage::open(file).ok()?;
+    let info = img.title_info().ok().flatten()?;
+    let resolved = fatxlib::titles::lookup(info.execution_info.title_id)?;
+    let sanitized = sanitize_fatx_filename(resolved.name);
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+/// Coerce a free-form string into something FATX will accept as a filename.
+/// Replaces characters the filesystem rejects with `-`, collapses runs of
+/// whitespace, trims edge punctuation, and truncates to FATX's 42-byte
+/// filename limit.
+fn sanitize_fatx_filename(raw: &str) -> String {
+    const MAX_LEN: usize = 42;
+    // FATX rejects: < > : " / \ | ? *  (plus controls). Replace with '-'.
+    let mut cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            c if c.is_control() => '-',
+            c => c,
+        })
+        .collect();
+    while cleaned.contains("  ") {
+        cleaned = cleaned.replace("  ", " ");
+    }
+    let trimmed = cleaned.trim_matches(['.', ' ']);
+    if trimmed.len() <= MAX_LEN {
+        trimmed.to_string()
+    } else {
+        trimmed
+            .chars()
+            .take(MAX_LEN)
+            .collect::<String>()
+            .trim_end_matches(['.', ' ', '-'])
+            .to_string()
+    }
 }
 
 fn dirs_or_home() -> PathBuf {
@@ -651,8 +721,13 @@ fn io_worker(
                         continue;
                     }
                 };
-                let entries = match img.walk_files() {
-                    Ok(v) => v,
+                let plan = match fatxlib::iso::manifest::build_manifest(
+                    &mut img,
+                    fatxlib::iso::manifest::IsoFilterPolicy {
+                        keep_systemupdate: false,
+                    },
+                ) {
+                    Ok(plan) => plan,
                     Err(e) => {
                         let _ = resp_tx.send(IoResp::Error {
                             message: format!("Walk {}: {}", source.display(), e),
@@ -669,21 +744,10 @@ fn io_worker(
                     continue;
                 }
 
-                // Xbox 360 disc images carry a `$SystemUpdate` folder with
-                // the dashboard update payload. Alt dashboards never run it,
-                // and copying it just wastes hundreds of MiB of FATX space —
-                // so partition them out before counting totals so the per-file
-                // progress denominator reflects what we'll actually write.
-                let (kept, skipped): (
-                    Vec<&fatxlib::xiso::XisoFile>,
-                    Vec<&fatxlib::xiso::XisoFile>,
-                ) = entries
-                    .iter()
-                    .partition(|e| !is_xiso_junk(&e.path.replace('\\', "/")));
-                let total_files = kept.len();
-                let total_bytes: u64 = kept.iter().map(|f| f.size).sum();
-                let skipped_files = skipped.len();
-                let skipped_bytes: u64 = skipped.iter().map(|f| f.size).sum();
+                let total_files = plan.kept_files();
+                let total_bytes = plan.kept_bytes;
+                let skipped_files = plan.skipped_files();
+                let skipped_bytes = plan.skipped_bytes;
 
                 let mut files_done = 0usize;
                 let mut bytes_done: u64 = 0;
@@ -692,7 +756,7 @@ fn io_worker(
                 let mut cancelled = false;
                 let mut failed = false;
 
-                for entry in &kept {
+                for entry in plan.kept() {
                     if cancel_flag.load(Ordering::Relaxed) {
                         cancelled = true;
                         break;
@@ -799,6 +863,159 @@ fn io_worker(
                             skipped_note,
                         ),
                     });
+                }
+            }
+
+            IoCmd::ConvertXisoToGod { source, dest_dir } => {
+                cancel_flag.store(false, Ordering::Relaxed);
+
+                let display_source = source
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| source.display().to_string());
+
+                let upload_dest = dest_dir.trim_end_matches('/').to_string();
+
+                // Dry-run first so we can resolve the human-readable title
+                // and announce the destination before the streaming pass.
+                let mut dry_opts = fatxlib::iso::god::ConvertOptions {
+                    trim: fatxlib::iso::god::TrimMode::Compact,
+                    dry_run: true,
+                    ..Default::default()
+                };
+                let report = match fatxlib::iso::god::convert_iso_to_fatx(
+                    &source,
+                    &mut vol,
+                    &dest_dir,
+                    &mut dry_opts,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = resp_tx.send(IoResp::Error {
+                            message: format!("Parse {}: {}", source.display(), e),
+                        });
+                        continue;
+                    }
+                };
+                let resolved_name = fatxlib::titles::lookup(report.title_id).map(|t| t.name);
+
+                let _ = resp_tx.send(IoResp::Progress {
+                    message: format!(
+                        "Converting {} ({}) → {}/{:08X}/00007000/{:08X}...",
+                        display_source,
+                        resolved_name.unwrap_or("unknown title"),
+                        upload_dest,
+                        report.title_id,
+                        report.media_id,
+                    ),
+                });
+
+                // Wire progress + cancel hooks. Both closures share the
+                // same lifetime so they can co-exist in ConvertOptions.
+                let cancel_flag_inner = cancel_flag.clone();
+                let abort_fn = move || cancel_flag_inner.load(Ordering::Relaxed);
+                let resp_tx_inner = resp_tx.clone();
+                let mut last_stage = String::new();
+                let mut last_emit_at: Option<std::time::Instant> = None;
+                let mut last_emit_bytes: u64 = 0;
+                let mut progress_cb = move |stage: &str, current: u64, total: u64| {
+                    let stage_changed = stage != last_stage;
+                    let now = std::time::Instant::now();
+
+                    // Byte-level stages ("part X/Y"): rate-limit to ~200 ms
+                    // intervals, and compute MiB/s from the delta between
+                    // emits. Stage transitions always emit so the user sees
+                    // each part's first tick immediately.
+                    if stage.starts_with("part ") {
+                        if !stage_changed
+                            && let Some(t) = last_emit_at
+                            && now.duration_since(t).as_millis() < 200
+                        {
+                            return;
+                        }
+                        let throughput = if !stage_changed {
+                            last_emit_at
+                                .map(|t| {
+                                    let dt = now.duration_since(t).as_secs_f64();
+                                    let dbytes = current.saturating_sub(last_emit_bytes);
+                                    let rate = (dbytes as f64) / dt / (1024.0 * 1024.0);
+                                    format!(" @ {:.1} MiB/s", rate)
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let msg = format!(
+                            "[{}] {} / {}{}",
+                            stage,
+                            format_size(current),
+                            format_size(total),
+                            throughput
+                        );
+                        let _ = resp_tx_inner.send(IoResp::Progress { message: msg });
+                    } else {
+                        // Integer-milestone stages (parts / mht / header):
+                        // keep the 5 % throttle, render the raw count.
+                        let denom = total.max(1);
+                        let stride = (denom / 20).max(1);
+                        if !stage_changed
+                            && current != 0
+                            && current != total
+                            && !current.is_multiple_of(stride)
+                        {
+                            return;
+                        }
+                        let _ = resp_tx_inner.send(IoResp::Progress {
+                            message: format!("[{}] {}/{}", stage, current, total),
+                        });
+                    }
+
+                    last_stage = stage.to_string();
+                    last_emit_at = Some(now);
+                    last_emit_bytes = current;
+                };
+
+                let mut opts = fatxlib::iso::god::ConvertOptions {
+                    trim: fatxlib::iso::god::TrimMode::Compact,
+                    game_title: resolved_name,
+                    dry_run: false,
+                    progress: Some(&mut progress_cb),
+                    should_abort: Some(&abort_fn),
+                };
+
+                match fatxlib::iso::god::convert_iso_to_fatx(
+                    &source, &mut vol, &dest_dir, &mut opts,
+                ) {
+                    Ok(r) => {
+                        let _ = vol.flush();
+                        // Rough total: per-part overhead (4 KiB master +
+                        // 4 KiB × subparts) plus the CON header. Reporting
+                        // the source-side data size is close enough.
+                        let _ = resp_tx.send(IoResp::Done {
+                            message: format!(
+                                "Converted {} → {}/{:08X}/00007000/{:08X} ({} parts, ~{})",
+                                display_source,
+                                upload_dest,
+                                r.title_id,
+                                r.media_id,
+                                r.part_count,
+                                format_size(r.data_size),
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = vol.flush();
+                        let msg = format!("{}", e);
+                        if msg.contains("cancelled") {
+                            let _ = resp_tx.send(IoResp::Cancelled {
+                                message: format!("GoD conversion cancelled ({})", display_source),
+                            });
+                        } else {
+                            let _ = resp_tx.send(IoResp::Error {
+                                message: format!("GoD convert: {}", msg),
+                            });
+                        }
+                    }
                 }
             }
 
@@ -1333,9 +1550,8 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
             }
         }
         KeyCode::Char('u') => {
-            let default = app.download_dir.to_string_lossy().to_string();
             app.input_prompt = format!("Upload file/directory to '{}':", app.cwd);
-            app.input_buffer = default;
+            app.input_buffer.clear();
             app.input_mode = InputMode::UploadPath;
         }
         KeyCode::Char('m') => {
@@ -1477,14 +1693,35 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
                     app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
                     app.is_busy = true;
                 } else if is_xiso(&path) {
-                    // Detected an Xbox disc image. Ask the user whether to
-                    // extract the contents (preferred — alt dashboards launch
-                    // loose game files directly) or fall back to raw copy.
-                    app.pending_xiso_upload = Some(path.clone());
+                    // Detected an Xbox disc image. Pick the default action
+                    // based on cwd: inside a per-user Content folder (where
+                    // GoD packages live), default to GoD; everywhere else
+                    // default to extract (works for alt dashboards).
+                    let default = if fatxlib::display::folder_slot(&app.cwd)
+                        == fatxlib::display::FolderSlot::TitleId
+                    {
+                        XisoUploadAction::God
+                    } else {
+                        XisoUploadAction::Extract
+                    };
+                    let prompt = match default {
+                        XisoUploadAction::Extract => format!(
+                            "Detected XISO '{}'. e(X)tract / (g)oD / (r)aw / Esc:",
+                            filename
+                        ),
+                        XisoUploadAction::God => format!(
+                            "Detected XISO '{}'. e(x)tract / (G)oD / (r)aw / Esc:",
+                            filename
+                        ),
+                        XisoUploadAction::Raw => format!(
+                            "Detected XISO '{}'. e(x)tract / (g)oD / (R)aw / Esc:",
+                            filename
+                        ),
+                    };
+                    app.pending_xiso_upload = Some((path.clone(), default));
                     app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
-                    app.input_mode = InputMode::ConfirmExtractXiso;
-                    app.input_prompt =
-                        format!("Detected XISO '{}'. Extract contents? (Y/n):", filename);
+                    app.input_mode = InputMode::ConfirmXisoUpload;
+                    app.input_prompt = prompt;
                     app.input_buffer.clear();
                 } else {
                     let fatx_path = app.full_path(&filename);
@@ -1497,15 +1734,28 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
                     app.is_busy = true;
                 }
             } else if app.input_prompt.starts_with("Detected XISO") {
-                // Y / empty (default) → extract; N → fall back to raw byte copy.
-                let extract = input.is_empty()
-                    || input.eq_ignore_ascii_case("y")
-                    || input.eq_ignore_ascii_case("yes");
-                let path = match app.pending_xiso_upload.take() {
-                    Some(p) => p,
+                let (path, default) = match app.pending_xiso_upload.take() {
+                    Some(pair) => pair,
                     None => {
                         app.set_error("Internal: missing pending XISO path.");
                         return;
+                    }
+                };
+                let trimmed = input.trim();
+                let action = if trimmed.is_empty() {
+                    default
+                } else {
+                    match trimmed.chars().next().map(|c| c.to_ascii_lowercase()) {
+                        Some('x') => XisoUploadAction::Extract,
+                        Some('g') => XisoUploadAction::God,
+                        Some('r') => XisoUploadAction::Raw,
+                        _ => {
+                            app.set_error(&format!(
+                                "Unknown choice {:?} — expected x, g, or r.",
+                                trimmed
+                            ));
+                            return;
+                        }
                     }
                 };
                 let filename = path
@@ -1513,28 +1763,48 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "iso".to_string());
 
-                if extract {
-                    // Default subfolder name = file stem (no extension); fall
-                    // back to the whole filename if the path has no extension.
-                    let stem = path
-                        .file_stem()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| filename.clone());
-                    let dest_dir = app.full_path(&stem);
-                    app.set_status(&format!("Extracting '{}' → {}...", filename, dest_dir));
-                    let _ = cmd_tx.send(IoCmd::ExtractXiso {
-                        source: path,
-                        dest_dir,
-                    });
-                    app.is_busy = true;
-                } else {
-                    let fatx_path = app.full_path(&filename);
-                    app.set_status(&format!("Uploading '{}' (raw)...", filename));
-                    let _ = cmd_tx.send(IoCmd::WriteFile {
-                        local_path: path,
-                        fatx_path,
-                    });
-                    app.is_busy = true;
+                match action {
+                    XisoUploadAction::Extract => {
+                        // Prefer a catalog-resolved folder name over the
+                        // local filename stem: a disc named `disc1.iso`
+                        // with TitleID 0x4D5307E6 should land at
+                        // `<cwd>/Halo 3 [4D5307E6]/` rather than `<cwd>/disc1/`.
+                        // Falls back to the file stem on catalog miss or
+                        // unreadable XEX/XBE.
+                        let stem = path
+                            .file_stem()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| filename.clone());
+                        let resolved = xiso_folder_name(&path).unwrap_or(stem);
+                        let dest_dir = app.full_path(&resolved);
+                        app.set_status(&format!("Extracting '{}' → {}...", filename, dest_dir));
+                        let _ = cmd_tx.send(IoCmd::ExtractXiso {
+                            source: path,
+                            dest_dir,
+                        });
+                        app.is_busy = true;
+                    }
+                    XisoUploadAction::God => {
+                        let dest_dir = app.cwd.clone();
+                        app.set_status(&format!(
+                            "Converting '{}' to GoD under {}...",
+                            filename, dest_dir
+                        ));
+                        let _ = cmd_tx.send(IoCmd::ConvertXisoToGod {
+                            source: path,
+                            dest_dir,
+                        });
+                        app.is_busy = true;
+                    }
+                    XisoUploadAction::Raw => {
+                        let fatx_path = app.full_path(&filename);
+                        app.set_status(&format!("Uploading '{}' (raw)...", filename));
+                        let _ = cmd_tx.send(IoCmd::WriteFile {
+                            local_path: path,
+                            fatx_path,
+                        });
+                        app.is_busy = true;
+                    }
                 }
             } else if app.input_prompt.starts_with("New directory") {
                 // Mkdir
@@ -1594,7 +1864,7 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
         KeyCode::Char(c) => {
             if app.input_mode == InputMode::ConfirmDelete
                 || app.input_mode == InputMode::ConfirmCleanup
-                || app.input_mode == InputMode::ConfirmExtractXiso
+                || app.input_mode == InputMode::ConfirmXisoUpload
             {
                 app.input_buffer = c.to_string();
             } else {
@@ -1696,12 +1966,17 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if app.input_mode != InputMode::Normal {
         let input_text = format!(" {} {}", app.input_prompt, app.input_buffer);
         let input_bar = Paragraph::new(input_text)
-            .style(Style::default().fg(Color::LightYellow).bg(Color::Blue))
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::DarkGray)
+                    .bold(),
+            )
             .block(
                 Block::default()
                     .title(" Input (Enter to confirm, Esc to cancel) ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::LightYellow)),
+                    .border_style(Style::default().fg(Color::Yellow).bold()),
             );
         frame.render_widget(input_bar, chunks[2]);
 
@@ -1774,21 +2049,112 @@ mod tests {
 
     #[test]
     fn test_is_xiso_junk_systemupdate() {
-        assert!(is_xiso_junk("$SystemUpdate"));
-        assert!(is_xiso_junk("$SystemUpdate/su20076000_00000000"));
-        assert!(is_xiso_junk("/$SystemUpdate/anything"));
+        assert!(fatxlib::iso::policy::is_systemupdate_path("$SystemUpdate"));
+        assert!(fatxlib::iso::policy::is_systemupdate_path(
+            "$SystemUpdate/su20076000_00000000"
+        ));
+        assert!(fatxlib::iso::policy::is_systemupdate_path(
+            "/$SystemUpdate/anything"
+        ));
     }
 
     #[test]
     fn test_is_xiso_junk_case_insensitive() {
-        assert!(is_xiso_junk("$SYSTEMUPDATE/foo"));
-        assert!(is_xiso_junk("$systemupdate/foo"));
+        assert!(fatxlib::iso::policy::is_systemupdate_path(
+            "$SYSTEMUPDATE/foo"
+        ));
+        assert!(fatxlib::iso::policy::is_systemupdate_path(
+            "$systemupdate/foo"
+        ));
+    }
+
+    #[test]
+    fn test_sanitize_fatx_filename_replaces_illegal_chars() {
+        assert_eq!(
+            sanitize_fatx_filename("Halo: Combat Evolved"),
+            "Halo- Combat Evolved"
+        );
+        assert_eq!(
+            sanitize_fatx_filename(r"Tom Clancy's R6: Vegas <DEMO>"),
+            "Tom Clancy's R6- Vegas -DEMO-"
+        );
+        assert_eq!(
+            sanitize_fatx_filename("path/with\\slashes"),
+            "path-with-slashes"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_fatx_filename_truncates_to_42_bytes() {
+        let long = "A Really Long Game Subtitle That Definitely Will Not Fit";
+        let s = sanitize_fatx_filename(long);
+        assert!(s.len() <= 42, "got {:?} ({} bytes)", s, s.len());
+        // Truncation should be at a word boundary or just under 42 bytes;
+        // never end with a dangling separator.
+        assert!(!s.ends_with(' '));
+        assert!(!s.ends_with('-'));
+        assert!(!s.ends_with('.'));
+    }
+
+    #[test]
+    fn test_sanitize_fatx_filename_collapses_runs_of_whitespace() {
+        assert_eq!(
+            sanitize_fatx_filename("Halo  3   Anniversary"),
+            "Halo 3 Anniversary"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_fatx_filename_trims_edges() {
+        assert_eq!(sanitize_fatx_filename("  Halo 3   "), "Halo 3");
+        assert_eq!(sanitize_fatx_filename("...Halo 3..."), "Halo 3");
+    }
+
+    #[test]
+    fn test_xiso_upload_default_god_inside_xuid_folder() {
+        // cwd directly inside /Content/<XUID>/ should default to GoD,
+        // because that's where Xbox 360 BC looks for title-id folders.
+        assert_eq!(
+            fatxlib::display::folder_slot("/Content/0000000000000000"),
+            fatxlib::display::FolderSlot::TitleId
+        );
+        assert_eq!(
+            fatxlib::display::folder_slot("/Content/E0001A0BC2E16C4D"),
+            fatxlib::display::FolderSlot::TitleId
+        );
+    }
+
+    #[test]
+    fn test_xiso_upload_default_extract_elsewhere() {
+        // Anywhere outside `/Content/<XUID>/` should default to extract.
+        assert_ne!(
+            fatxlib::display::folder_slot("/"),
+            fatxlib::display::FolderSlot::TitleId
+        );
+        assert_ne!(
+            fatxlib::display::folder_slot("/Games"),
+            fatxlib::display::FolderSlot::TitleId
+        );
+        assert_ne!(
+            fatxlib::display::folder_slot("/Content"),
+            fatxlib::display::FolderSlot::TitleId
+        );
+        // Deeper than the XUID folder: we're inside a title-id folder
+        // already, so children are content-type folders — extract default.
+        assert_ne!(
+            fatxlib::display::folder_slot("/Content/0000000000000000/4D530002"),
+            fatxlib::display::FolderSlot::TitleId
+        );
     }
 
     #[test]
     fn test_is_xiso_junk_does_not_match_substring() {
-        assert!(!is_xiso_junk("default.xbe"));
-        assert!(!is_xiso_junk("Media/$SystemUpdate")); // not the first segment
-        assert!(!is_xiso_junk("MyGame$SystemUpdate/foo"));
+        assert!(!fatxlib::iso::policy::is_systemupdate_path("default.xbe"));
+        assert!(!fatxlib::iso::policy::is_systemupdate_path(
+            "Media/$SystemUpdate"
+        )); // not the first segment
+        assert!(!fatxlib::iso::policy::is_systemupdate_path(
+            "MyGame$SystemUpdate/foo"
+        ));
     }
 }

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process;
 use std::time::Instant;
 
-use fatxlib::xiso::XisoImage;
+use fatxlib::iso::image::XisoImage;
 
 fn human_size(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];

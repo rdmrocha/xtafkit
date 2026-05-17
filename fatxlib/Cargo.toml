@@ -16,7 +16,17 @@ libc = "0.2"
 phf = "0.13"
 hmac = "0.13"
 sha1 = "0.11"
-xdvdfs = { version = "0.8", default-features = false, features = ["std", "read", "sync"] }
+byteorder = "1.5"
+num_enum = "0.7"
+openssl = { version = "0.10", optional = true }
+xdvdfs = { version = "0.8", default-features = false, features = ["std", "read", "write", "sync"] }
+
+[features]
+default = ["openssl-hash"]
+# Route iso2god's hot-path SHA-1 through `openssl::sha::sha1` (ARMv8 SHA
+# on Apple Silicon, SHA-NI on x86). Disable if the host's OpenSSL is
+# hard to find; everything falls back to the RustCrypto `sha1` crate.
+openssl-hash = ["dep:openssl"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.31", features = ["fs", "ioctl"] }

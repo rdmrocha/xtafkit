@@ -5,7 +5,7 @@ mod common;
 use std::fs::File;
 use std::io::Cursor;
 
-use fatxlib::xiso::XisoImage;
+use fatxlib::iso::image::XisoImage;
 
 // ---------------------------------------------------------------------------
 // Negative paths — always runnable
@@ -61,8 +61,8 @@ fn walks_fixture_image() {
     );
     let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
     assert!(
-        names.iter().any(|n| n.ends_with("default.xbe")),
-        "expected default.xbe in fixture; got {:?}",
+        names.iter().any(|n| n.ends_with("default.xex")),
+        "expected default.xex (XellLaunch2_retail) in fixture; got {:?}",
         names
     );
 }
@@ -158,6 +158,21 @@ fn extract_fixture_into_fatx_volume() {
             "extracted {fatx_path} does not match XISO source"
         );
     }
+}
+
+#[test]
+fn fixture_title_info_returns_xellaunch() {
+    let Some(mut img) = open_fixture() else {
+        return;
+    };
+    let info = img
+        .title_info()
+        .expect("title_info should succeed on fixture")
+        .expect("fixture has a Default.xex, so title_info must be Some");
+    assert_eq!(
+        info.execution_info.title_id, 0xFFFF011D,
+        "fixture default.xex is XellLaunch2_retail (TitleID 0xFFFF011D)"
+    );
 }
 
 #[test]

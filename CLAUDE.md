@@ -6,7 +6,7 @@ Rust toolkit for reading and writing FATX/XTAF file systems on Xbox/Xbox 360 for
 ## Architecture
 - **Cargo workspace** with two crates:
   - `fatxlib` — Library crate. FATX/XTAF volume implementation, types, partition detection, platform I/O. Also: bundled title catalog (Xbox 360 + Original Xbox), STFS header parser, profile (Account) blob decryption, slot-aware display formatting.
-  - `xtafkit` (root) — Single binary (`xtafkit`). Five subcommands via clap (`browse`, `ls`, `scan`, `mkimage`, `resolve`); no-args entry point launches the TUI via guided picker. Ratatui-based TUI is the primary UX. Test image generator (`mkimage`) is the only non-TUI write path that ships.
+  - `xtafkit` (root) — Single binary (`xtafkit`). Seven subcommands via clap (`browse`, `ls`, `scan`, `mkimage`, `resolve`, `extract`, `god`); no-args entry point launches the TUI via guided picker. Ratatui-based TUI is the primary UX. `extract` and `god` handle XISO work; `mkimage` is the only non-TUI write path that targets FATX/XTAF itself.
 
 ## Key Technical Details
 
@@ -84,10 +84,15 @@ cargo run -p fatxlib --example check_profile -- /path/to/profile-file
 - Commit and push at each milestone (working feature, major fix, etc.)
 
 ### XISO / disc-image support
-- `fatxlib::xiso` wraps `xdvdfs` (sync feature, no async runtime) and exposes `XisoImage::{open, walk_files, read_into, file_reader, read_at}` plus a `LAYOUTS` table for raw / XGD1 / XGD2 / XGD3 pre-partition offsets.
+- `fatxlib::iso` owns ISO-domain work:
+  - `image` wraps `xdvdfs` (sync feature, no async runtime) and exposes `XisoImage::{open, walk_files, read_into, file_reader, read_at}` plus a `LAYOUTS` table for raw / XGD1 / XGD2 / XGD3 pre-partition offsets.
+  - `manifest` builds the shared ISO file manifest, skips `$SystemUpdate` by default, and feeds both extract and compact planning.
+  - `compact` builds a dense virtual XDVDFS image for hard-trim GoD conversion.
+  - `god` owns GoD packaging.
+- `xtafkit extract` streams XISO files to disk; `xtafkit god` converts XISO to GoD and defaults to `compact` trim.
 - TUI upload (`u`) sniffs every local file with `XisoImage::open`. On a hit, the user is prompted **Extract contents (Y/n)** — default extracts via `IoCmd::ExtractXiso`, `n` falls back to raw `WriteFile`. Extraction streams each entry through `XisoFileReader` → `FatxVolume::create_file_from_reader`, which keeps the working set at one cluster regardless of image size.
 - Useful because Aurora / FreeStyle Dash / XBMC4XBOX scan the drive for loose `default.xex` / `default.xbe` and launch them directly; STFS-wrapped GoD packaging is **not** required for those dashboards.
 
 ## Future Work (Deferred)
 - Eager / deferred-sync auto-resolve for files inside STFS content-type folders (Marketplace/Arcade/etc.) — currently on-demand only
-- `iso2god`-style ISO → Games-on-Demand conversion (cherry-picked from iso2god-rs, refactored for streaming) — needed only for Xbox 360 BC, which requires STFS GoD packages; alt-dashboard playback already works via the XISO extract flow above
+- Further split `fatxlib::iso::god::convert` into a pure conversion core plus transport-specific sinks if the current host-FS / FATX split starts accumulating more policy

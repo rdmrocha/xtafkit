@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Mac-native TUI workbench for Xbox 360 (XTAF) and Original Xbox (FATX) drives. Plug a console drive into your Mac over USB, then browse, transfer files, resolve game titles, and decode profile gamertags from a polished terminal UI.
+Mac-native TUI workbench for Xbox 360 (XTAF) and Original Xbox (FATX) drives. Plug a console drive into your Mac over USB, then browse, transfer files, resolve game titles, decode profile gamertags, and work with XISO disc images from a polished terminal UI plus a small CLI surface.
 
 ## Highlights
 
@@ -10,6 +10,7 @@ Mac-native TUI workbench for Xbox 360 (XTAF) and Original Xbox (FATX) drives. Pl
 - **Title resolution** — ~5,500 Xbox 360 and Original Xbox games compiled in, with on-demand STFS header parsing for anything the catalog misses
 - **Profile gamertag extraction** — decrypts the embedded Account file (ARC4 + HMAC-SHA1) to label profile XUIDs
 - **Per-file resolution** for Arcade / XNA / Marketplace / Installer folders, with one-keystroke bulk scan
+- **XISO extraction and GoD conversion** — stream XISO contents to a local directory or build Games-on-Demand packages for Xbox 360 backward-compatible titles
 - **Sort toggle** — by resolved name or by raw ID (display format flips to match)
 - **Persistent caches** under `~/.config/xtafkit/` — plain text, human-editable
 - macOS-native I/O (`F_NOCACHE`, `F_RDAHEAD`, device-optimal alignment)
@@ -33,6 +34,8 @@ cargo build --release
 ```
 
 Produces a single binary: `target/release/xtafkit`.
+
+The default build links against the system OpenSSL for hardware-accelerated SHA-1 during GoD conversion. On macOS install via Homebrew (`brew install openssl@3`); on Debian/Ubuntu install `libssl-dev`. To skip the OpenSSL dependency entirely and fall back to portable Rust SHA-1, build with `cargo build --release --no-default-features`.
 
 ## Quick start
 
@@ -59,9 +62,15 @@ xtafkit ls <DEVICE> [PATH] [-l]               list files (text in TTY, JSON when
 xtafkit scan <DEVICE> [--deep]                detect FATX/XTAF partitions
 xtafkit mkimage <PATH> [--size 1G] [--populate] [--format fatx|xtaf]
 xtafkit resolve <DEVICE> <PATH>               STFS-based title / file resolution
+xtafkit extract <ISO> <DEST> [--keep-systemupdate] [--dry-run]
+xtafkit god <ISO> <DEST> [--trim compact|preserve-layout|none] [--dry-run] [--game-title TITLE]
 ```
 
-Six subcommands total — file operations (download/upload/mkdir/rm/rename/copy/info/cleanup) live inside the TUI.
+Seven subcommands total — file operations (download/upload/mkdir/rm/rename/copy/info/cleanup) live inside the TUI.
+
+## XISO Tools
+
+`xtafkit extract` streams every file from an XISO to a local directory and skips `$SystemUpdate` by default. `xtafkit god` converts an XISO into a Games-on-Demand package; the default trim mode is `compact`, which repacks XDVDFS densely before GoD packaging. Pass `--trim preserve-layout` to keep mastered holes, or `--trim none` to use the full data partition.
 
 ## TUI
 
@@ -83,13 +92,31 @@ sudo xtafkit browse /dev/rdisk4 --partition "360 Data"
 | `R` | Resolve title or bulk-scan files (slot-aware) |
 | `s` | Toggle sort: by name ⇄ by ID (flips bracket order) |
 | `m` | Create directory |
-| `d` / `u` | Download / upload |
+| `d` / `u` | Download / upload (XISO uploads prompt for e**(X)**tract / **(G)**oD / **(R)**aw — see below) |
 | `D` / `r` | Delete / rename |
 | `i` | Volume info |
 | `c` | Clean up macOS metadata |
 | `Esc` / `q` | Cancel running operation / quit |
 
 Entries that can be resolved show a `?` marker. Resolution results are cached under `~/.config/xtafkit/` and persist across runs.
+
+### Uploading an XISO
+
+When the file you point at is an Xbox / Xbox 360 disc image (XDVDFS volume detected automatically), the upload prompt becomes:
+
+```
+Detected XISO 'Halo.iso'. e(X)tract / (G)oD / (R)aw / Esc:
+```
+
+| Choice | Result |
+|---|---|
+| **(X)tract** | Walks the XISO and writes each file into `<cwd>/<name>/` on the drive. `$SystemUpdate` is skipped automatically. `<name>` is the catalog-known game title when available, otherwise the local filename stem. Best for alt dashboards (Aurora / FreeStyle / XBMC4XBOX) that launch loose `default.xex` / `default.xbe` directly. |
+| **(G)oD** | Streams a Games-on-Demand package into `<cwd>/<TitleID>/00007000/<MediaID>{,.data/}`. Uses the compact trim by default so the output is sized to actual content, not the original mastered layout. Required for stock Xbox 360 backward-compatibility playback. |
+| **(R)aw** | Plain byte-for-byte copy of the source ISO file. |
+
+The default action (the capitalized letter) flips by context: inside `/Content/<XUID>/` the default is **G** (where the dashboard looks for BC packages); everywhere else the default is **X**.
+
+Press `Esc` to cancel mid-conversion at any time — the worker checks between parts and between hash-tree steps.
 
 ## `xtafkit resolve`
 
@@ -142,7 +169,7 @@ Tests use file-backed FATX/XTAF images generated by `xtafkit mkimage`. No hardwa
 
 ## Origin
 
-`xtafkit` started as a fork of [joshuareisbord/fatx-rs](https://github.com/joshuareisbord/fatx-rs), which provided the FATX/XTAF filesystem core. The project has since diverged — title catalog with merged Xbox 360 + Original Xbox sources, on-demand STFS resolution, profile gamertag decryption, slot-aware folder display, TUI-first workflow, and a deliberate scope reduction (the NFS Finder-mount server was removed in favor of doing all file operations inside the TUI). Credit to the original author for the filesystem foundation.
+`xtafkit` started as a fork of [joshuareisbord/fatx-rs](https://github.com/joshuareisbord/fatx-rs), which provided the FATX/XTAF filesystem core. The project has since diverged — title catalog with merged Xbox 360 + Original Xbox sources, on-demand STFS resolution, profile gamertag decryption, slot-aware folder display, TUI-first workflow, XISO extraction, and Games-on-Demand conversion. Credit to the original author for the filesystem foundation.
 
 ## License
 

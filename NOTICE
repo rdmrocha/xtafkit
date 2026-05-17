@@ -16,3 +16,62 @@ Licensed under the Apache License, Version 2.0.
 
 xtafkit and the upstream fatx-rs are both licensed under the Apache
 License, Version 2.0. See LICENSE for the full license text.
+
+Third-party code vendored under Apache-2.0-compatible licenses:
+
+iso2god (in fatxlib/src/iso/god/)
+---------------------------------
+Vendored from QAston/iso2god-rs (xdvdfx branch), itself a fork of
+iliazeus/iso2god-rs. Both are MIT-licensed:
+
+  Copyright (c) 2023 Ilia Pozdnyakov
+
+  Permission is hereby granted, free of charge, to any person obtaining
+  a copy of this software and associated documentation files (the
+  "Software"), to deal in the Software without restriction, including
+  without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to
+  the following conditions:
+
+  The above copyright notice and this permission notice shall be
+  included in all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+  CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+  TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+  SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Upstream sources:
+  https://github.com/iliazeus/iso2god-rs        (parent)
+  https://github.com/QAston/iso2god-rs/tree/xdvdfx  (vendored branch)
+
+Local adaptations made when vendoring:
+  - anyhow::Error replaced with fatxlib's FatxError so callers see one
+    error type across the library.
+  - Intra-crate imports rewritten from `crate::god` / `crate::executable`
+    to `crate::iso::god` / `crate::executable`.
+  - The upstream `src/game_list/` (~5 KLOC compiled-in title catalog)
+    was NOT vendored; fatxlib's existing `titles` module covers the
+    same purpose with broader data.
+
+XellLaunch2_retail.xex (in fatxlib/tests/fixtures/tiny.xiso)
+-----------------------------------------------------------
+XellLaunch is a public homebrew launcher from the Free60.org project
+that boots `xell-2f.bin` (the XeLL bootloader) from a CON / LIVE
+container. We embed `XellLaunch2_retail.xex` inside the `tiny.xiso`
+test fixture so the round-trip and walk tests can exercise our XEX
+parser and full ISO → GoD pipeline against a real Xbox 360 executable
+without shipping a copyrighted game. The XEX is consumed as a data
+file for testing only; it is not linked into the xtafkit binary.
+
+Upstream:
+  https://free60project.github.io/wiki/XeLL.html
+
+XellLaunch carries the Title ID 0xFFFF011D (homebrew / dev range).
+If you have license concerns about this fixture, delete
+`fatxlib/tests/fixtures/tiny.xiso` and the dependent tests will
+gracefully skip.

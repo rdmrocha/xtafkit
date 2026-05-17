@@ -2,6 +2,36 @@
 
 All notable changes to `xtafkit` will be documented in this file.
 
+## [Unreleased]
+
+### ISO / disc-image support
+- Added `xtafkit extract` for streaming Xbox / Xbox 360 XISO contents to a local directory, with `$SystemUpdate` skipped by default. Supports `--keep-systemupdate` to override and `--dry-run` to preview file list + byte totals without writing.
+- Added `xtafkit god` for XISO → Games-on-Demand conversion. Default trim is `compact`; `preserve-layout` and `none` stay available for debugging and compatibility. Game-title slot in the CON header auto-fills from the bundled catalog; pass `--game-title TITLE` to override.
+- TUI upload (`u`) now sniffs every local file and, on XISO detection, prompts **e(X)tract / (G)oD / (R)aw / Esc**. Default flips by cwd context: inside `/Content/<XUID>/` defaults to GoD (BC playback target); everywhere else defaults to Extract (alt-dashboard target).
+- Extract destination folder name is resolved from the catalog when the title is known — `disc1.iso` with TitleID `4D5307E6` extracts as `Halo 3/` rather than `disc1/`. Falls back to the file stem on catalog miss. Names are sanitized for FATX (illegal chars replaced with `-`, runs of whitespace collapsed, truncated to 42 bytes).
+- Introduced a shared `fatxlib::iso` namespace for image reading, manifest planning, compact repacking, and GoD conversion.
+- Reworked compact GoD conversion to stream a virtual dense XDVDFS layout instead of staging a temporary ISO on disk — peak local disk usage during conversion is zero.
+- Centralized ISO filtering and planning so extract, compact trim, and dry-run reporting share the same manifest.
+- Removed the old public `fatxlib::xiso` and `fatxlib::iso2god` entry points in favor of `fatxlib::iso::{image,manifest,compact,god}`.
+- Refactored GoD conversion to share its engine between host-filesystem and FATX-volume targets via an internal `GodSink` trait — one `run_conversion` loop, two sink implementations.
+
+### Performance
+- Hot-path SHA-1 in GoD conversion routes through `openssl::sha::sha1` by default (ARMv8 SHA on Apple Silicon, SHA-NI on x86). Gated by the default-on `openssl-hash` cargo feature; disable to fall back to RustCrypto's `sha1` crate with zero system OpenSSL dependency.
+- Fixed a double-I/O bug in `write_part`: the upstream implementation read each subpart, hashed it, then `seek_relative`d back and re-read it via `io::copy` to write the part file. Now writes from the buffer it already has, halving I/O on the hot path (~33 % wall-time reduction on large ISOs).
+- 1 MiB `BufReader` on the source ISO during the metadata pre-pass cuts syscall tax on multi-GiB inputs.
+- Streaming variant of GoD conversion to FATX (`convert_iso_to_fatx`) builds each part in a reused ~163 MiB buffer and streams straight into the volume — no local staging.
+
+### TUI / quality of life
+- Mid-conversion `Esc` cancels GoD conversion cleanly (checked between parts and between MHT-chain steps); no partial silent failures.
+- Per-part byte-level progress with MiB/s throughput, rate-limited to ~200 ms intervals.
+- Upload prompt no longer prefills with the last-used path — always starts blank.
+- TUI extract worker skips `$SystemUpdate` and surfaces the skip count + bytes in the completion message.
+
+### Library API additions
+- `fatxlib::iso::image::XisoImage::title_info()` parses the embedded `Default.xex` / `default.xbe` and returns the title's execution info. Used by catalog name resolution and by the GoD conversion pipeline.
+- `fatxlib::executable` (top-level module) holds `TitleInfo` / `TitleExecutionInfo` and the XEX/XBE parsers — shared between `iso::image` and `iso::god`.
+- `fatxlib::volume::FatxVolume::create_file_from_reader` streams a file into FATX cluster-by-cluster from any `Read` source, capping working-set at one cluster regardless of total file size.
+
 ## [1.1.0] - 2026-05-16
 
 First release under the `xtafkit` name. Forked from
