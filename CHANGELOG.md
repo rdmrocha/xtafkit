@@ -2,6 +2,28 @@
 
 All notable changes to `xtafkit` will be documented in this file.
 
+## [1.3.0] - 2026-05-17
+
+Adds read-extraction for Xbox 360 STFS container packages — Arcade (XBLA), XBLIG, Title Updates, Marketplace DLC. New library surface under `fatxlib::stfs::extract` and a new `xtafkit extract-stfs` CLI subcommand. TUI integration for STFS is intentionally deferred to a later release.
+
+### STFS extraction
+- Added `xtafkit extract-stfs <PACKAGE>` for streaming Xbox 360 STFS containers (CON / LIVE / PIRS) to a local directory. `--to <DIR>` overrides the destination; `--dry-run` lists the entries with sizes and totals; `--json` emits machine-readable output for both dry-run and post-extract modes.
+- Default destination (no `--to`) is `./<DisplayName>/` taken straight from the STFS header — no catalog lookup, no `[TitleID]` suffix. The per-package `display_name` is consistently more specific than the title-id catalog mapping (notably for XBLIG, where every indie game shares the same system title-id and the catalog can only return a generic bucket name).
+- Read-only / type-1 STFS only. Type-0 (read-write, used by save games / on-drive system files / CON packages) surfaces an explicit `"STFS type 0 (read-write) not supported yet"` error rather than producing wrong output.
+- Block-index → byte-offset translator handles all interleaved hash levels: L0 every `0xAA` blocks, L1 every `0x70E4`, L2 every `0x4AF768`. Inline boundary tests pin offsets at `0xA9`, `0xAA`, `0x70E3`, `0x70E4` against literal hex values and assert strict monotonicity across boundaries.
+- File chain follower covers both the consecutive fast path (no hash-block reads) and the fragmented case (next-block pointer threaded through the L0 hash block at offset `(N % 0xAA) * 24 + 0x15`). Walk is capped at `used_blocks` iterations to reject malformed cyclic chains, mirroring the existing FAT cycle rejection in `volume.rs`.
+- Defensive parent-chain resolution in `extract_to_host`: rejects cyclic `parent_index` references and out-of-range parent pointers; refuses to overwrite existing output files.
+
+### Library API additions
+- New `fatxlib::stfs` submodules: `volume_descriptor`, `block_translator`, `file_entry`, `extract`. Existing header parsing (`StfsHeader`, `parse_header`, `MIN_HEADER_BYTES`) moved into `fatxlib::stfs::header` and re-exported at the namespace root — no breaking changes for existing callers.
+- `fatxlib::stfs::StfsPackage::{open, header, volume, entries, read_block_chain, read_file}` — read API for STFS packages. `read_file<W: Write>` streams through a writer; no full-file buffering even for multi-hundred-MiB packages.
+- `fatxlib::stfs::extract::extract_to_host(&mut StfsPackage, &Path, Option<ProgressFn>) -> Result<ExtractReport>` — top-level walk + write, with progress callback shape matching the existing XISO extract (`(rel_path, file_size, total_bytes_so_far)`).
+- `fatxlib::stfs::extract::ExtractReport` — `{ files, directories, bytes }` returned on success.
+
+### Testing / maintenance
+- 27 inline synthetic tests across the four new STFS submodules: volume-descriptor parsing (type-0/1 detection, wrong-size rejection, truncation), type-1 block translator (boundary indices at every hash level plus monotonicity), file entry parsing (consecutive flag, directory flag, parent-index, non-ASCII tolerance), and end-to-end synthetic package extraction with a nested directory tree.
+- v2 TUI extract-gating rule documented in the design spec: the future TUI sniff prompt will offer `(X)tract` only when the package contains a `default.xex` file (the only reliable signal that loose extraction produces something useful for alt-dashboards). Fallback: gate on `content_type == 0x000D0000`. The CLI `extract-stfs` is unrestricted.
+
 ## [1.2.1] - 2026-05-17
 
 Maintenance and hardening release on top of 1.2.0. No new features; all changes are bug fixes, internal refactors that reduce drift, and test coverage for areas that previously had none.

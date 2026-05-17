@@ -6,6 +6,7 @@
 //!   xtafkit scan /dev/rdisk4
 //!   xtafkit ls /dev/rdisk4 --partition "Data (E)" /
 
+mod extract_stfs;
 mod mkimage;
 mod tui;
 
@@ -186,6 +187,20 @@ enum Commands {
         #[arg(long, action = clap::ArgAction::SetTrue)]
         keep_systemupdate: bool,
         /// Print what would be extracted without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Extract every file from an Xbox 360 STFS package (CON / LIVE / PIRS)
+    /// to a local directory. Works on Arcade (XBLA), XBLIG, Title Updates,
+    /// Marketplace DLC, and other type-1 packages.
+    ExtractStfs {
+        /// Source STFS package
+        package: PathBuf,
+        /// Destination directory (created if missing). Defaults to
+        /// `./<title-name> [<TitleID>]/` (or `./<file-stem>/` on catalog miss).
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// Print the file list and totals without writing anything.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1146,6 +1161,12 @@ fn main() {
             dry_run,
             game_title,
         }) => run_god(&iso, &dest, &trim, dry_run, game_title.as_deref(), json),
+
+        Some(Commands::ExtractStfs {
+            package,
+            to,
+            dry_run,
+        }) => extract_stfs::run_extract_stfs(&package, to.as_deref(), dry_run, json),
     }
 }
 
