@@ -2,6 +2,46 @@
 
 All notable changes to `xtafkit` will be documented in this file.
 
+## [1.2.1] - 2026-05-17
+
+Maintenance and hardening release on top of 1.2.0. No new features; all changes are bug fixes, internal refactors that reduce drift, and test coverage for areas that previously had none.
+
+### Correctness / hardening
+- Fixed `XBE` certificate parsing reading 4 bytes past `dwVersion` — the version field landed in the LAN-key region, so every Original Xbox executable routed through `TitleInfo::from_xbe` was returning a wrong version. Seek width corrected from 164 to 160 bytes.
+- Fixed `ConHeaderBuilder::with_game_title` panicking on titles ≥ 64 UTF-16 code units; the UTF-16 writer now caps at the field length (0x80 bytes / 64 units, null included) for both title slots in the CON header.
+- Fixed `looks_like_gamertag` rejecting all non-Latin gamertags — Cyrillic, CJK, Greek, etc. now resolve correctly. ASCII-only checks replaced with `is_alphabetic` / `is_alphanumeric`.
+- Fixed `pick_profile_name` caching STFS system-package titles ("Xbox 360 Dashboard") as if they were gamertags; candidates now run through `looks_like_gamertag` before being accepted.
+- Fixed `seek(SeekFrom::End(0))` silently returning 0 on macOS raw block devices: `partition::detect_xbox_partitions`, `partition::scan_for_fatx`, and `FatxVolume::open` now error explicitly when given a zero `device_size`. `scan_for_fatx` also gained an explicit `device_size: u64` parameter, with the CLI deep-scan caller updated accordingly.
+- Fixed FAT16/FAT32 selection drifting from the FATX-specific 65520 (0xFFF0) threshold. `volume.rs` and `mkimage.rs` now use the `FAT16_CLUSTER_THRESHOLD` constant from `fatxlib::types`. Volumes with 65520–65524 clusters were previously mislabeled as FAT16.
+- Fixed `FatxVolume::write_file_in_place` not flushing the FAT cache between chain extension (Phase 1) and payload writes (Phase 2); a mid-operation failure could previously leave the directory entry advertising clusters the on-disk FAT had not yet linked.
+- Fixed `validate_filename` measuring byte length instead of character count when comparing against the 42-char FATX cap.
+- Fixed `FatxVolume::stats` panicking in debug builds (or wrapping in release) when corrupt cached counts produced `free + bad > total`; counts are now `saturating_sub`'d.
+- Fixed host-to-FATX directory copies reading entire files into memory; large host-FS uploads now stream cluster-by-cluster through `create_file_from_reader`.
+- Fixed the guided picker's stale `sudo fatx` hint — now `sudo xtafkit`.
+- Tightened `build.rs` catalog floor checks (`xbox360 > 4000`, `xbox_og > 800`) so a truncated source no longer ships an empty or partial title map. The literal-pairing loop in `write_merged` was simplified to a single pass over the merged map, eliminating a parallel `values()` / `iter()` zip that was correct only by coincidence of `BTreeMap` iteration order.
+- Centralized FATX cluster allocation behind two private helpers (`reserve_free_clusters`, `link_allocated_clusters`); previously three near-identical bitmap-walk + chain-linking copies in `allocate_chain`, `write_file_in_place`, and `plan_write_in_place_for_entry` could drift on independent fixes.
+
+### TUI / quality of life
+- Installed a panic hook and `Drop`-based terminal guard so a crash inside Ratatui or the background IO worker no longer leaves the shell in raw mode with the alternate screen stuck.
+- The UI now detects `TryRecvError::Disconnected` on the IO response channel: if the worker thread dies unexpectedly the UI surfaces the failure and quits cleanly instead of freezing on `is_busy` with no way out.
+- Flush errors after destructive operations are no longer silently swallowed. A shared `flush_or_error` helper is wired into `WriteFile`, `CopyDir`, `ExtractXiso`, `ConvertXisoToGod`, `Mkdir`, `Delete`, `Rename`, `Cleanup`, and `Flush` — a failed FAT commit can no longer be reported as "uploaded successfully."
+- Single-delete confirmation captures the selection at prompt time via a new `pending_delete` field rather than re-reading the current selection at Enter — closes a race where a background `ListDir` refresh could re-sort entries mid-confirmation and re-target the delete.
+- Replaced prompt-string `starts_with` dispatch in `handle_input_key` with an exhaustive `match` on `InputMode`, so every input mode has a single, type-checked completion handler.
+
+### Testing / maintenance
+- Pinned `HashList` semantics with direct fixed-byte tests: `read` preserves offsets and zero gaps, `write` emits exactly 4 KiB, and `HashList::new().digest()` matches `sha1(b"\0" * 4096)` byte-for-byte.
+- Rewrote the GoD MHT back-chain test to seed via `HashList::read` (not `add_hash`) and assert against literal SHA-1 byte arrays for a three-part conversion, so byte-order or padding regressions in `digest()` and propagation bugs in the back-chain surface immediately.
+- Added a `write_file_in_place` FAT-flush regression test that injects post-flush write failures through a new file-backed `FailingWriteFile` wrapper, reopens the image, and asserts the chain extension survived the failure.
+- Added FAT16/FAT32 boundary tests at exactly `FAT16_CLUSTER_THRESHOLD` and `THRESHOLD - 1` — `fat_type_for_cluster_estimate` extracted to a private module function so the predicate is unit-testable in isolation.
+- Added direct `partition` tests covering both the zero-size error path and a planted-magic happy path on `detect_xbox_partitions` and `scan_for_fatx`.
+- Added an XBE certificate regression test that builds a synthetic header and verifies `title_id` and `version` are read from the correct offsets.
+- Added a CON header truncation test for `with_game_title` at oversized inputs.
+- Added a Cyrillic gamertag case ("Игрок 7") to the `looks_like_gamertag` rules and a `pick_profile_name` test that rejects the overlong "Xbox 360 Dashboard" candidate.
+- Moved the volume stats saturation test inline into `volume.rs` so the `force_stats_counts_for_test` public helper could be deleted; `fatxlib/tests/stats.rs` removed.
+- Removed redundant scaffolding tests: `fatxlib/tests/fixture_test.rs` (three "did `open()` succeed" checks already covered by every other integration test) and five `optimization.rs` tests that either re-tested already-covered invariants (`test_bitmap_consistent_after_allocations`, `test_bitmap_consistent_after_free_chain`, `test_flush_after_no_changes_is_noop`) or labeled themselves alignment tests while only exercising file-backed (non-aligned) I/O (`test_default_alignment_works`, `test_read_write_at_various_offsets`).
+- `tests/cli_integration::test_scan_image` now asserts the command actually succeeded instead of discarding the exit code.
+
+
 ## [1.2.0] - 2026-05-17
 
 ### ISO / disc-image support
