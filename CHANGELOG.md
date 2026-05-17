@@ -2,7 +2,7 @@
 
 All notable changes to `xtafkit` will be documented in this file.
 
-## [Unreleased]
+## [1.2.0] - 2026-05-17
 
 ### ISO / disc-image support
 - Added `xtafkit extract` for streaming Xbox / Xbox 360 XISO contents to a local directory, with `$SystemUpdate` skipped by default. Supports `--keep-systemupdate` to override and `--dry-run` to preview file list + byte totals without writing.
