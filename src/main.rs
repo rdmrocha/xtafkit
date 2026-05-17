@@ -876,7 +876,7 @@ fn main() {
             }
             if deep && !json {
                 println!("\nDeep scanning up to 0x{:X}...", deep_limit);
-                match fatxlib::partition::scan_for_fatx(&mut file, deep_limit) {
+                match fatxlib::partition::scan_for_fatx(&mut file, dev_size, deep_limit) {
                     Ok(offsets) => {
                         if offsets.is_empty() {
                             println!("No additional signatures found.");

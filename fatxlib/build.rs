@@ -43,7 +43,7 @@ fn main() {
         "xbox360 title catalog unexpectedly small"
     );
     assert!(
-        xbox_og.len() > 500,
+        xbox_og.len() > 800,
         "xbox original title catalog unexpectedly small"
     );
     let (merged, conflicts) = merge(&xbox360, &xbox_og);

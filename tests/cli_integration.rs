@@ -240,6 +240,9 @@ fn test_scan_image() {
         .output()
         .expect("run scan on image");
 
-    // Scan on a small image may or may not find partitions, but should not crash.
-    let _ = output.status;
+    assert!(
+        output.status.success(),
+        "scan on image failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

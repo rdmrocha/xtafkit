@@ -38,6 +38,11 @@ fn returns_none_for_unknown_id() {
 #[test]
 fn merged_map_coverage_floor() {
     // 5133 (360) + 990 (OG) - 613 (overlap) = 5510. Floor at 5400 for slack.
-    // Compile-time guard: negative array length is a compile error.
-    const _: [(); ENTRY_COUNT - 5400] = [(); ENTRY_COUNT - 5400];
+    const fn assert_title_catalog_floor(count: usize) {
+        if count < 5400 {
+            panic!("title catalog unexpectedly small");
+        }
+    }
+
+    const _: () = assert_title_catalog_floor(ENTRY_COUNT);
 }

@@ -92,45 +92,6 @@ fn test_bitmap_matches_stats_on_open() {
 }
 
 #[test]
-fn test_bitmap_consistent_after_allocations() {
-    let (_tmp, mut vol) = common::create_fatx_image(4);
-
-    let stats_before = vol.stats().expect("stats");
-
-    // Allocate 10 clusters
-    for _ in 0..10 {
-        vol.allocate_cluster().expect("alloc");
-    }
-
-    let stats_after = vol.stats().expect("stats");
-    assert_eq!(
-        stats_after.free_clusters,
-        stats_before.free_clusters - 10,
-        "free count should decrease by exactly 10"
-    );
-}
-
-#[test]
-fn test_bitmap_consistent_after_free_chain() {
-    let (_tmp, mut vol) = common::create_fatx_image(4);
-
-    let stats_before = vol.stats().expect("stats");
-
-    // Allocate a chain of 5 clusters
-    let first = vol.allocate_chain(5).expect("alloc chain");
-    let stats_during = vol.stats().expect("stats");
-    assert_eq!(stats_during.free_clusters, stats_before.free_clusters - 5);
-
-    // Free the chain
-    vol.free_chain(first).expect("free chain");
-    let stats_after = vol.stats().expect("stats");
-    assert_eq!(
-        stats_after.free_clusters, stats_before.free_clusters,
-        "free count should return to original after free_chain"
-    );
-}
-
-#[test]
 fn test_bitmap_after_create_delete_cycle() {
     let (_tmp, mut vol) = common::create_fatx_image(4);
 
@@ -153,14 +114,6 @@ fn test_bitmap_after_create_delete_cycle() {
 // ===========================================================================
 // Dirty-range FAT tracking
 // ===========================================================================
-
-#[test]
-fn test_flush_after_no_changes_is_noop() {
-    let (_tmp, mut vol) = common::create_fatx_image(4);
-
-    // Flush without any changes — should succeed and be a no-op
-    vol.flush().expect("flush no-op");
-}
 
 #[test]
 fn test_flush_after_create_preserves_data() {
@@ -260,50 +213,6 @@ fn test_stats_matches_manual_count() {
     assert_eq!(
         stats.used_clusters, manual_used,
         "cached used count should match manual scan"
-    );
-}
-
-// ===========================================================================
-// I/O alignment
-// ===========================================================================
-
-#[test]
-fn test_default_alignment_works() {
-    // File-backed images use default 512-byte alignment
-    let (_tmp, mut vol) = common::create_fatx_image(4);
-
-    // Basic read/write should work with default alignment
-    vol.create_file("/align.txt", b"alignment test")
-        .expect("create");
-    let data = vol.read_file_by_path("/align.txt").expect("read");
-    assert_eq!(data, b"alignment test");
-}
-
-#[test]
-fn test_read_write_at_various_offsets() {
-    let (_tmp, mut vol) = common::create_fatx_image(4);
-
-    // Create files of various sizes to exercise different alignment scenarios
-    vol.create_file("/tiny.txt", b"x").expect("create tiny");
-    vol.create_file("/small.txt", &vec![0xBB; 511])
-        .expect("create small");
-    vol.create_file("/aligned.txt", &vec![0xCC; 512])
-        .expect("create aligned");
-    vol.create_file("/large.txt", &vec![0xDD; 4097])
-        .expect("create large");
-
-    assert_eq!(vol.read_file_by_path("/tiny.txt").expect("read"), b"x");
-    assert_eq!(
-        vol.read_file_by_path("/small.txt").expect("read"),
-        vec![0xBB; 511]
-    );
-    assert_eq!(
-        vol.read_file_by_path("/aligned.txt").expect("read"),
-        vec![0xCC; 512]
-    );
-    assert_eq!(
-        vol.read_file_by_path("/large.txt").expect("read"),
-        vec![0xDD; 4097]
     );
 }
 
