@@ -63,6 +63,7 @@ use ratatui::{
 
 use fatxlib::iso::image::XisoImage;
 use fatxlib::partition::format_size;
+use fatxlib::stfs::StfsPackage;
 use fatxlib::types::FileAttributes;
 use fatxlib::volume::FatxVolume;
 
@@ -129,6 +130,18 @@ enum XisoUploadAction {
     Raw,
 }
 
+/// What to do with a local STFS package that's being uploaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StfsUploadAction {
+    /// Walk the package and stream each file into `<cwd>/<DisplayName>/`.
+    /// Only offered when `default.xex` is present at the package root —
+    /// the only reliable signal that loose extraction produces something
+    /// alt-dashboards can launch.
+    Extract,
+    /// Copy the source bytes byte-for-byte to `<cwd>/<filename>`.
+    Raw,
+}
+
 /// How to order the directory listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortMode {
@@ -164,6 +177,13 @@ enum IoCmd {
     /// `dest_dir` on the FATX volume, recreating the directory tree. The dest
     /// directory itself is created by the worker; it must not already exist.
     ExtractXiso {
+        source: PathBuf,
+        dest_dir: String,
+    },
+    /// Open `source` as an STFS package and stream every inner file into
+    /// `<dest_dir>` on the FATX volume. The dest directory is created by
+    /// the worker; it must not already exist.
+    ExtractStfsToFatx {
         source: PathBuf,
         dest_dir: String,
     },
@@ -260,6 +280,10 @@ enum InputMode {
     /// `r` falls back to a raw byte copy of the source file.
     /// The default action on bare Enter depends on cwd context.
     ConfirmXisoUpload,
+    /// Two-way prompt after detecting an extractable STFS package during
+    /// upload: `x` extracts the contents into `<cwd>/<DisplayName>/`,
+    /// `r` falls back to a raw byte copy of the source file.
+    ConfirmStfsUpload,
 }
 
 struct App {
@@ -286,6 +310,9 @@ struct App {
     /// Local XISO path + default action stashed between the upload prompt
     /// and the three-way confirmation prompt (extract / GoD / raw).
     pending_xiso_upload: Option<(PathBuf, XisoUploadAction)>,
+    /// Local STFS path + destination subfolder name stashed between the
+    /// upload prompt and the extract/raw confirmation prompt.
+    pending_stfs_upload: Option<(PathBuf, StfsExtractTarget)>,
     /// Current listing sort order. Toggleable with `s`.
     sort_mode: SortMode,
 }
@@ -316,6 +343,48 @@ fn is_xiso(path: &std::path::Path) -> bool {
         Ok(file) => XisoImage::open(file).is_ok(),
         Err(_) => false,
     }
+}
+
+/// Information needed to extract an STFS package to the FATX volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StfsExtractTarget {
+    /// Sanitised subfolder name to create under cwd. Derived from the
+    /// package's STFS `display_name` (falling back to `title_name`, then
+    /// the local filename stem).
+    pub dest_name: String,
+}
+
+/// Returns `Some(target)` if `path` is a type-1 STFS package containing a
+/// depth-0 `default.xex`. The sniff opens the package, validates the
+/// header, walks the file table, and closes the file before returning.
+///
+/// Returns `None` for: not an STFS file, type-0 (read-write) packages,
+/// truncated/corrupt headers, packages without a root `default.xex`,
+/// and any I/O error during the walk. Errors are swallowed deliberately —
+/// the sniff is best-effort; if anything goes wrong the user falls
+/// through to the raw-upload path.
+fn stfs_extract_target(path: &std::path::Path) -> Option<StfsExtractTarget> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut pkg = StfsPackage::open(file).ok()?;
+    if !pkg.has_default_xex().ok()? {
+        return None;
+    }
+    let display = pkg.header().display_name.trim().to_string();
+    let title = pkg.header().title_name.trim().to_string();
+    let raw = if !display.is_empty() {
+        display
+    } else if !title.is_empty() {
+        title
+    } else {
+        path.file_stem()?.to_string_lossy().into_owned()
+    };
+    let sanitized = sanitize_fatx_filename(&raw);
+    if sanitized.is_empty() {
+        return None;
+    }
+    Some(StfsExtractTarget {
+        dest_name: sanitized,
+    })
 }
 
 /// Resolve the destination folder name for an XISO extract by reading the
@@ -394,6 +463,7 @@ impl App {
             pending_cleanup: Vec::new(),
             pending_delete: None,
             pending_xiso_upload: None,
+            pending_stfs_upload: None,
             sort_mode: SortMode::ByName,
         }
     }
@@ -1178,6 +1248,99 @@ fn io_worker(
                 let _ = resp_tx.send(resp);
             }
 
+            IoCmd::ExtractStfsToFatx { source, dest_dir } => {
+                cancel_flag.store(false, Ordering::Relaxed);
+
+                let display_source = source
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| source.display().to_string());
+
+                let file = match fs::File::open(&source) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = resp_tx.send(IoResp::Error {
+                            message: format!("Open {}: {}", source.display(), e),
+                        });
+                        continue;
+                    }
+                };
+                let mut pkg = match fatxlib::stfs::StfsPackage::open(file) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = resp_tx.send(IoResp::Error {
+                            message: format!("Parse {}: {}", source.display(), e),
+                        });
+                        continue;
+                    }
+                };
+
+                // Compute total bytes (for progress denominator). If the
+                // entries() walk fails here, fall back to 0 — the actual
+                // extraction will surface the same error properly.
+                let bytes_total: u64 = match pkg.entries() {
+                    Ok(es) => es.iter().filter(|e| !e.is_directory).map(|e| e.size).sum(),
+                    Err(_) => 0,
+                };
+
+                // Throttled progress: send IoResp::Progress at most every 200ms.
+                let last_progress = std::cell::Cell::new(std::time::Instant::now());
+                let resp_tx_for_cb = resp_tx.clone();
+                let cancel_for_cb = Arc::clone(&cancel_flag);
+                let cb = move |rel: &str, _size: u64, bytes_done: u64| {
+                    if cancel_for_cb.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if last_progress.get().elapsed().as_millis() > 200 {
+                        let _ = resp_tx_for_cb.send(IoResp::Progress {
+                            message: format!(
+                                "{} ({}/{})",
+                                rel,
+                                format_size(bytes_done),
+                                format_size(bytes_total),
+                            ),
+                        });
+                        last_progress.set(std::time::Instant::now());
+                    }
+                };
+
+                match fatxlib::stfs::extract::extract_to_fatx(
+                    &mut pkg,
+                    &mut vol,
+                    &dest_dir,
+                    Some(&cb),
+                    Some(&cancel_flag),
+                ) {
+                    Ok(report) => {
+                        if flush_or_error(&mut vol, &resp_tx, "STFS extract flush failed") {
+                            continue;
+                        }
+                        let _ = resp_tx.send(IoResp::Done {
+                            message: format!(
+                                "Extracted {} → {} ({} files, {})",
+                                display_source,
+                                dest_dir,
+                                report.files,
+                                format_size(report.bytes),
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = flush_or_error(&mut vol, &resp_tx, "STFS extract flush failed");
+                        let msg = format!("{}", e);
+                        if msg.contains("cancelled") {
+                            let _ = resp_tx.send(IoResp::Cancelled {
+                                message: format!("STFS extract cancelled: {}", display_source),
+                            });
+                        } else {
+                            let _ = resp_tx.send(IoResp::Error {
+                                message: format!("Extract {}: {}", source.display(), msg),
+                            });
+                        }
+                    }
+                }
+            }
+
             IoCmd::Flush => {
                 if flush_or_error(&mut vol, &resp_tx, "Flush failed") {
                     continue;
@@ -1703,6 +1866,7 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
             // If the user was answering the XISO extract/raw prompt, drop the
             // stashed path so the next upload starts clean.
             app.pending_xiso_upload = None;
+            app.pending_stfs_upload = None;
             app.pending_delete = None;
             app.set_status("Cancelled.");
         }
@@ -1782,6 +1946,20 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
                         app.download_dir =
                             path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
                         app.input_mode = InputMode::ConfirmXisoUpload;
+                        app.input_prompt = prompt;
+                        app.input_buffer.clear();
+                    } else if let Some(target) = stfs_extract_target(&path) {
+                        // ── New STFS two-way prompt ──
+                        let prompt = format!(
+                            "Detected STFS '{}' (Arcade). e(X)tract / (R)aw / Esc:",
+                            path.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "package".to_string()),
+                        );
+                        app.pending_stfs_upload = Some((path.clone(), target));
+                        app.download_dir =
+                            path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
+                        app.input_mode = InputMode::ConfirmStfsUpload;
                         app.input_prompt = prompt;
                         app.input_buffer.clear();
                     } else {
@@ -1930,6 +2108,59 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
                         app.set_status("Cleanup cancelled.");
                     }
                 }
+                InputMode::ConfirmStfsUpload => {
+                    let (path, target) = match app.pending_stfs_upload.take() {
+                        Some(pair) => pair,
+                        None => {
+                            app.set_error("Internal: missing pending STFS path.");
+                            return;
+                        }
+                    };
+                    let trimmed = input.trim();
+                    let action = if trimmed.is_empty() {
+                        StfsUploadAction::Extract
+                    } else {
+                        match trimmed.chars().next().map(|c| c.to_ascii_lowercase()) {
+                            Some('x') => StfsUploadAction::Extract,
+                            Some('r') => StfsUploadAction::Raw,
+                            _ => {
+                                app.set_error(&format!(
+                                    "Unknown choice {:?} — expected x or r.",
+                                    trimmed
+                                ));
+                                return;
+                            }
+                        }
+                    };
+                    let filename = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "stfs".to_string());
+
+                    match action {
+                        StfsUploadAction::Extract => {
+                            let dest_dir = app.full_path(&target.dest_name);
+                            app.set_status(&format!(
+                                "Extracting STFS '{}' → {}...",
+                                filename, dest_dir
+                            ));
+                            let _ = cmd_tx.send(IoCmd::ExtractStfsToFatx {
+                                source: path,
+                                dest_dir,
+                            });
+                            app.is_busy = true;
+                        }
+                        StfsUploadAction::Raw => {
+                            let fatx_path = app.full_path(&filename);
+                            app.set_status(&format!("Uploading '{}' (raw)...", filename));
+                            let _ = cmd_tx.send(IoCmd::WriteFile {
+                                local_path: path,
+                                fatx_path,
+                            });
+                            app.is_busy = true;
+                        }
+                    }
+                }
                 InputMode::Normal => {}
             }
         }
@@ -1939,7 +2170,10 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
         KeyCode::Char(c) => {
             if matches!(
                 app.input_mode,
-                InputMode::ConfirmDelete | InputMode::ConfirmCleanup | InputMode::ConfirmXisoUpload
+                InputMode::ConfirmDelete
+                    | InputMode::ConfirmCleanup
+                    | InputMode::ConfirmXisoUpload
+                    | InputMode::ConfirmStfsUpload
             ) {
                 app.input_buffer = c.to_string();
             } else {
@@ -2231,5 +2465,78 @@ mod tests {
         assert!(!fatxlib::iso::policy::is_systemupdate_path(
             "MyGame$SystemUpdate/foo"
         ));
+    }
+
+    #[test]
+    fn stfs_extract_target_returns_none_for_non_stfs() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"not an stfs package\x00\x00").unwrap();
+        assert!(stfs_extract_target(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn stfs_extract_target_returns_none_for_stfs_without_default_xex() {
+        // Build a minimal STFS package with no default.xex at root.
+        let bytes = make_synthetic_stfs_no_default_xex();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        assert!(stfs_extract_target(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn stfs_extract_target_returns_dest_name_for_arcade_package() {
+        let bytes = make_synthetic_stfs_with_default_xex("My Test Game");
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        let target = stfs_extract_target(tmp.path()).expect("should detect");
+        // Destination name comes from display_name, sanitized for FATX.
+        assert_eq!(target.dest_name, "My Test Game");
+    }
+
+    fn make_synthetic_stfs_no_default_xex() -> Vec<u8> {
+        // 32 KiB of zeros except the LIVE magic + a valid volume descriptor
+        // + a file-table block with one non-default.xex file.
+        let mut buf = vec![0u8; 0x1_0000];
+        buf[0..4].copy_from_slice(b"LIVE");
+        buf[0x379] = 0x24;
+        buf[0x37B] = 0x01;
+        buf[0x37C..0x37E].copy_from_slice(&1u16.to_be_bytes());
+        buf[0x395..0x399].copy_from_slice(&2u32.to_be_bytes());
+        // File table at block 0 starts at 0xC000
+        let mut e = vec![0u8; 0x40];
+        e[..9].copy_from_slice(b"other.bin");
+        e[0x28] = 0x09 | 0x40; // length=9, consecutive
+        e[0x2C] = 1; // used_blocks
+        e[0x2F] = 1; // start_block = 1
+        e[0x32..0x34].copy_from_slice(&(-1i16).to_be_bytes());
+        e[0x34..0x38].copy_from_slice(&4u32.to_be_bytes());
+        buf[0xC000..0xC000 + 0x40].copy_from_slice(&e);
+        buf
+    }
+
+    fn make_synthetic_stfs_with_default_xex(display_name: &str) -> Vec<u8> {
+        let mut buf = vec![0u8; 0x1_0000];
+        buf[0..4].copy_from_slice(b"LIVE");
+        buf[0x379] = 0x24;
+        buf[0x37B] = 0x01;
+        buf[0x37C..0x37E].copy_from_slice(&1u16.to_be_bytes());
+        buf[0x395..0x399].copy_from_slice(&2u32.to_be_bytes());
+
+        // Write display_name into the locale-0 UTF-16BE slot at 0x411.
+        for (i, c) in display_name.encode_utf16().enumerate() {
+            let off = 0x411 + i * 2;
+            buf[off..off + 2].copy_from_slice(&c.to_be_bytes());
+        }
+
+        // File-table block at 0xC000: one entry, default.xex, root.
+        let mut e = vec![0u8; 0x40];
+        e[..11].copy_from_slice(b"default.xex");
+        e[0x28] = 0x0B | 0x40;
+        e[0x2C] = 1;
+        e[0x2F] = 1;
+        e[0x32..0x34].copy_from_slice(&(-1i16).to_be_bytes());
+        e[0x34..0x38].copy_from_slice(&4u32.to_be_bytes());
+        buf[0xC000..0xC000 + 0x40].copy_from_slice(&e);
+        buf
     }
 }
