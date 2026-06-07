@@ -3,7 +3,8 @@
 [![Release](https://img.shields.io/github/v/release/rdmrocha/xtafkit?include_prereleases&sort=semver)](https://github.com/rdmrocha/xtafkit/releases)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-[![Buy me a coffee](https://img.shields.io/badge/buy%20me%20a%20coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black)](http://paypal.me/rdmrocha)
+[![Github Sponsors](https://img.shields.io/badge/Fund_Development-GitHub_Sponsors-6c003e?logo=githubsponsors&labelColor=rgba(0,0,0,0))](https://github.com/sponsors/rdmrocha)\
+[![Buy me a coffee](https://img.shields.io/badge/Buy_me_a_coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black)](http://paypal.me/rdmrocha)
 
 Mac-native TUI workbench for Xbox 360 (XTAF) and Original Xbox (FATX) drives. Plug a console drive into your Mac over USB, then browse, transfer files, resolve game titles, decode profile gamertags, and work with XISO disc images from a polished terminal UI plus a small CLI surface.
 
