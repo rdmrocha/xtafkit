@@ -1,6 +1,6 @@
 # xtafkit
 
-[![Release](https://img.shields.io/github/v/release/rdmrocha/xtafkit?include_prereleases&sort=semver)](https://github.com/rdmrocha/xtafkit/releases)
+[![Release](https://img.shields.io/github/v/release/rdmrocha/xtafkit)](https://github.com/rdmrocha/xtafkit/releases)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 [![Github Sponsors](https://img.shields.io/badge/Fund_Development-GitHub_Sponsors-6c003e?logo=githubsponsors&labelColor=rgba(0,0,0,0))](https://github.com/sponsors/rdmrocha)\
